@@ -101,9 +101,9 @@ class InstructionAgent(BaseAgent):
                 continue
             
             console.print(f"[green]Executing: {tool_name}({args})[/green]")
-            
+
             # Execute tool
-            result = self._execute_tool(tool, tool_name, args)
+            result = self._execute_tool(tool, tool_name, args, state)
             result["task_id"] = task_id
             result["purpose"] = purpose
             
@@ -151,7 +151,7 @@ class InstructionAgent(BaseAgent):
         
         return state
     
-    def _execute_tool(self, tool, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute_tool(self, tool, tool_name: str, args: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool and return result."""
         result = {
             "tool": tool_name,
@@ -160,18 +160,34 @@ class InstructionAgent(BaseAgent):
             "stderr": "",
             "success": False,
         }
-        
+
         try:
             method = getattr(tool, tool_name, None)
             if method is None:
                 result["stderr"] = f"Unknown tool: {tool_name}"
                 return result
-            
+
             output = method(**args)
-            result["stdout"] = output
-            result["success"] = not output.startswith("Error:")
-            
+
+            # Pwninit 특수 처리 - dict 반환
+            if tool_name == "Pwninit" and isinstance(output, dict):
+                result["stdout"] = output.get("output", "")
+                result["success"] = output.get("success", False)
+
+                # 패치된 바이너리로 경로 업데이트
+                patched = output.get("patched_binary")
+                if patched:
+                    old_path = state.get("binary_path", "")
+                    state["binary_path"] = patched
+                    state["original_binary_path"] = old_path  # 원본 보관
+                    tool.binary_path = patched  # Tool 인스턴스도 업데이트
+                    result["stdout"] += f"\n\n[AUTO] binary_path updated: {patched}"
+                    console.print(f"[green]Binary path updated to: {patched}[/green]")
+            else:
+                result["stdout"] = str(output) if output else ""
+                result["success"] = not str(output).startswith("Error:")
+
         except Exception as e:
             result["stderr"] = str(e)
-        
+
         return result

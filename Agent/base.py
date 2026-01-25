@@ -63,7 +63,6 @@ MODEL_PRICING = {
     "gpt-4o": {"input": 2.50, "cached_input": 1.25, "output": 10.00},
     "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
     # Gemini
-    # NOTE: pricing/context for preview models may change; adjust as needed.
     "gemini-3-flash-preview": {"input": 0.15, "cached_input": 0.0375, "output": 0.60},
     "gemini-2.5-flash": {"input": 0.15, "cached_input": 0.0375, "output": 0.60},
     "gemini-2.0-flash": {"input": 0.10, "cached_input": 0.025, "output": 0.40},

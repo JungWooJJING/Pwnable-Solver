@@ -10,8 +10,9 @@ from LangGraph.state import (
 )
 
 # Jinja2 environment setup
+# ChainableUndefined: 속성 접근 시 에러 대신 빈 값 반환
 env = jinja2.Environment(
-    undefined=jinja2.StrictUndefined,
+    undefined=jinja2.ChainableUndefined,
     trim_blocks=True,
     lstrip_blocks=True,
 )
@@ -565,6 +566,95 @@ payload = flat(
 """
 
 
+DOCKER_GUIDANCE = """## Docker - Exploit Testing Environment
+
+When `pwninit` patched binary doesn't work locally, use Docker to test in actual challenge environment.
+
+### Docker_setup - Auto-configure Docker environment
+
+```json
+{
+  "tool": "Docker_setup",
+  "args": {
+    "port": 1337,
+    "ubuntu_version": "22.04"
+  }
+}
+```
+
+**What it does:**
+1. If Dockerfile exists → use it
+2. If no Dockerfile → auto-generate one with:
+   - Ubuntu base image
+   - Copies binary + provided libc files
+   - Sets up socat to serve the binary on specified port
+
+**Parameters:**
+- `port` (int, default=1337): Port to expose
+- `ubuntu_version` (str, default="22.04"): Ubuntu version if auto-generating
+- `timeout` (int, default=300): Build timeout in seconds
+
+### Docker_exploit_test - Run exploit against Docker
+
+```json
+{
+  "tool": "Docker_exploit_test",
+  "args": {
+    "port": 1337
+  }
+}
+```
+
+Runs `exploit.py` against the Docker container. Auto-detects flags in output.
+
+**Parameters:**
+- `exploit_path` (str, optional): Path to exploit.py (default: Challenge/<binary>/exploit.py)
+- `port` (int, default=1337): Target port
+- `timeout` (int, default=60): Execution timeout
+
+### Docker_stop - Stop and cleanup
+
+```json
+{
+  "tool": "Docker_stop",
+  "args": {}
+}
+```
+
+Stops and removes the container.
+
+### Docker_status - Check running containers
+
+```json
+{
+  "tool": "Docker_status",
+  "args": {}
+}
+```
+
+Lists all pwn-related Docker containers.
+
+### When to Use Docker
+
+1. **Local pwninit exploit fails** - Environment mismatch
+2. **Different libc version** - Challenge provides specific libc
+3. **ASLR/environment differences** - Docker matches challenge environment
+4. **Final verification** - Before submitting to remote
+
+### Workflow Example
+
+```
+1. Exploit works locally with pwninit? → Done
+2. Doesn't work?
+   → Docker_setup (creates environment)
+   → Docker_exploit_test (test exploit)
+   → Analyze output, adjust exploit
+   → Repeat until success
+3. Docker_stop (cleanup)
+```
+"""
+
+
 # =============================================================================
 # Tool Description Renderer
 # =============================================================================
@@ -578,6 +668,10 @@ TOOL_GUIDANCES = {
     "ROPgadget": ROPGADGET_GUIDANCE,
     "Pwndbg": PWNDBG_GUIDANCE,
     "One_gadget": ONE_GADGET_GUIDANCE,
+    "Docker_setup": DOCKER_GUIDANCE,
+    "Docker_exploit_test": DOCKER_GUIDANCE,
+    "Docker_stop": DOCKER_GUIDANCE,
+    "Docker_status": DOCKER_GUIDANCE,
 }
 
 
@@ -611,9 +705,9 @@ ANALYSIS_DOCUMENT_TEMPLATE = env.from_string("""## Binary Information
 ### Decompiled Code
 {% if analysis.decompile.done %}
 {% for func in analysis.decompile.functions %}
-#### {{ func.name }} ({{ func.address }})
+#### {{ func.name | default("unknown") }} ({{ func.address | default("0x0") }})
 ```c
-{{ func.code }}
+{{ func.code | default("// No code available") }}
 ```
 {% endfor %}
 {% else %}
@@ -636,10 +730,10 @@ ANALYSIS_DOCUMENT_TEMPLATE = env.from_string("""## Binary Information
 ### Identified Vulnerabilities
 {% if analysis.vulnerabilities %}
 {% for vuln in analysis.vulnerabilities %}
-#### {{ vuln.type }} in `{{ vuln.function }}`
-- **Location:** {{ vuln.location }}
-- **Description:** {{ vuln.description }}
-{% if vuln.code_snippet %}
+#### {{ vuln.type | default("unknown") }} in `{{ vuln.function | default("unknown") }}`
+- **Location:** {{ vuln.location | default("N/A") }}
+- **Description:** {{ vuln.description | default("N/A") }}
+{% if vuln.code_snippet is defined and vuln.code_snippet %}
 ```c
 {{ vuln.code_snippet }}
 ```
@@ -697,7 +791,7 @@ ANALYSIS_DOCUMENT_TEMPLATE = env.from_string("""## Binary Information
 | Gadget | Address |
 |--------|---------|
 {% for g in analysis.gadgets %}
-| {{ g.instruction }} | {{ g.address }} |
+| {{ g.instruction | default("unknown") }} | {{ g.address | default("0x0") }} |
 {% endfor %}
 {% else %}
 [NOT YET]
@@ -970,7 +1064,7 @@ EXPLOIT_SYSTEM = env.from_string("""You are the **Exploit Agent** for a pwnable 
 {
   "reasoning": "Exploitation strategy explanation",
   "exploit_type": "ret2libc",
-  "exploit_code": "from pwn import *\\n\\n# Setup\\ncontext.binary = './vuln'\\n...",
+  "exploit_code": "from pwn import *\\nimport os\\n\\n# Setup - MUST use absolute path\\ncontext.binary = '{{ binary_path }}'\\n\\n# Remote/Local switching\\nhost = os.environ.get('TARGET_HOST', 'localhost')\\nport = int(os.environ.get('TARGET_PORT', 1337))\\n\\ndef solve():\\n    p = remote(host, port) if args.REMOTE else process(context.binary.path)\\n    # ... exploit logic\\n    p.interactive()\\n\\nif __name__ == '__main__':\\n    solve()",
   "key_steps": [
     "1. Overflow buffer to control return address",
     "2. Leak libc address via puts@plt",
@@ -986,9 +1080,24 @@ EXPLOIT_SYSTEM = env.from_string("""You are the **Exploit Agent** for a pwnable 
 
 ## Exploit Code Guidelines
 - Use pwntools (`from pwn import *`)
+- **CRITICAL: Use ABSOLUTE paths for binary** - `context.binary = '{{ binary_path }}'` (NOT relative paths like `./vuln`)
+- **DEFAULT: Use process() for local testing** - pwninit has patched the binary, so test locally first!
 - Include logging (`log.info`, `log.success`)
 - Add comments explaining each step
 - Handle common issues (alignment, null bytes)
+- Connection pattern (LOCAL FIRST, then remote):
+  ```python
+  import os
+  # Default: local testing with pwninit-patched binary
+  # Use REMOTE flag or env vars for remote testing
+  if args.REMOTE or os.environ.get('TARGET_HOST'):
+      host = os.environ.get('TARGET_HOST', 'localhost')
+      port = int(os.environ.get('TARGET_PORT', 1337))
+      p = remote(host, port)
+  else:
+      p = process(context.binary.path)
+  ```
+- **NEVER hardcode remote addresses** like `remote('host.example.com', 12345)` - always use the pattern above
 
 {{ tool_descriptions }}
 """)

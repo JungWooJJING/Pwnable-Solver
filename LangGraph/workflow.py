@@ -3,6 +3,7 @@ LangGraph Workflow Definition for PWN Solver
 
 Workflow:
     Plan → Instruction → Parsing → Feedback → (loop back to Plan or go to Exploit)
+    Exploit → Verify → (success → END, fail → Refine → Verify loop)
 """
 
 from typing import Literal
@@ -15,7 +16,10 @@ from LangGraph.node import (
     Parsing_node,
     Feedback_node,
     Exploit_node,
+    Verify_node,
+    Refine_node,
     should_continue,
+    route_after_verify,
 )
 
 
@@ -31,6 +35,8 @@ def build_workflow() -> StateGraph:
     workflow.add_node("parsing", Parsing_node)
     workflow.add_node("feedback", Feedback_node)
     workflow.add_node("exploit", Exploit_node)
+    workflow.add_node("verify", Verify_node)
+    workflow.add_node("refine", Refine_node)
 
     # Set entry point
     workflow.set_entry_point("plan")
@@ -51,8 +57,21 @@ def build_workflow() -> StateGraph:
         }
     )
 
-    # Exploit goes to end
-    workflow.add_edge("exploit", END)
+    # Exploit → Verify
+    workflow.add_edge("exploit", "verify")
+
+    # Verify → (end or refine)
+    workflow.add_conditional_edges(
+        "verify",
+        route_after_verify_wrapper,
+        {
+            "end": END,           # Success or max attempts
+            "refine": "refine",   # Need to fix exploit
+        }
+    )
+
+    # Refine → Verify (retry loop)
+    workflow.add_edge("refine", "verify")
 
     return workflow
 
@@ -73,6 +92,15 @@ def route_after_feedback(state: SolverState) -> Literal["plan", "exploit", "end"
     if exploit_readiness.get("recommend_exploit", False):
         return "exploit"
 
+    return "end"
+
+
+def route_after_verify_wrapper(state: SolverState) -> Literal["end", "refine"]:
+    """Wrapper for route_after_verify from node.py"""
+    result = route_after_verify(state)
+    # Ensure only valid outputs
+    if result == "refine":
+        return "refine"
     return "end"
 
 
@@ -100,4 +128,11 @@ if __name__ == "__main__":
     console.print("                    ┌───────────────┼───────────────┐")
     console.print("                    ↓               ↓               ↓")
     console.print("                  Plan          Exploit           END")
-    console.print("                (loop)         (ready)          (stop)")
+    console.print("                (loop)             ↓            (stop)")
+    console.print("                               Verify")
+    console.print("                                  ↓")
+    console.print("                         ┌───────┴───────┐")
+    console.print("                         ↓               ↓")
+    console.print("                       END           Refine")
+    console.print("                    (success)           ↓")
+    console.print("                                    Verify (retry)")

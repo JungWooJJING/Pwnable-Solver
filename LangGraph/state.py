@@ -180,6 +180,13 @@ class SolverState(TypedDict, total=False):
     detected_flag: str
     all_detected_flags: List[str]
 
+    # --- Exploit 검증 ---
+    exploit_attempts: int               # 현재 시도 횟수
+    max_exploit_attempts: int           # 최대 시도 횟수 (기본: 3)
+    exploit_verified: bool              # 익스플로잇 성공 여부
+    exploit_error: str                  # 마지막 에러 출력
+    exploit_path: str                   # 저장된 exploit.py 경로
+
 
 # =========================
 # State 초기화
@@ -250,6 +257,13 @@ def init_state(**overrides: Any) -> SolverState:
         "flag_detected": False,
         "detected_flag": "",
         "all_detected_flags": [],
+
+        # Exploit 검증
+        "exploit_attempts": 0,
+        "max_exploit_attempts": 3,
+        "exploit_verified": False,
+        "exploit_error": "",
+        "exploit_path": "",
     }
     state.update(overrides)
     return state
@@ -484,4 +498,68 @@ def mark_task_status(state: SolverState, task_id: str, status: TaskStatus) -> bo
             tasks[i] = t  # type: ignore[list-item]
             return True
     return False
+
+
+# =========================
+# Analysis Document 업데이트
+# =========================
+
+def merge_analysis_updates(state: SolverState, updates: Dict[str, Any]) -> None:
+    """
+    Analysis Document에 새로운 정보 머지.
+    Plan/Parsing Agent에서 공통으로 사용.
+    """
+    analysis = state.get("analysis", init_analysis())
+
+    # Checksec
+    if "checksec" in updates:
+        analysis["checksec"].update(updates["checksec"])
+
+    # Decompile
+    if "decompile" in updates:
+        if updates["decompile"].get("done"):
+            analysis["decompile"]["done"] = True
+
+        new_funcs = updates["decompile"].get("functions", [])
+        existing_names = {f["name"] for f in analysis["decompile"].get("functions", [])}
+
+        for func in new_funcs:
+            if func.get("name") not in existing_names:
+                analysis["decompile"]["functions"].append(func)
+
+    # Disasm
+    if "disasm" in updates:
+        analysis["disasm"].update(updates["disasm"])
+
+    # Vulnerabilities (append, don't overwrite)
+    if "vulnerabilities" in updates:
+        existing_vulns = {(v.get("type"), v.get("function")) for v in analysis.get("vulnerabilities", [])}
+
+        for vuln in updates["vulnerabilities"]:
+            key = (vuln.get("type"), vuln.get("function"))
+            if key not in existing_vulns:
+                analysis["vulnerabilities"].append(vuln)
+
+    # Strategy
+    if "strategy" in updates and updates["strategy"]:
+        analysis["strategy"] = updates["strategy"]
+
+    # Libc
+    if "libc" in updates:
+        analysis["libc"].update(updates["libc"])
+
+    # Gadgets (append)
+    if "gadgets" in updates:
+        existing_addrs = {g.get("address") for g in analysis.get("gadgets", [])}
+
+        for gadget in updates["gadgets"]:
+            if gadget.get("address") not in existing_addrs:
+                analysis["gadgets"].append(gadget)
+
+    # Boolean flags
+    for flag in ["leak_primitive", "control_hijack", "payload_ready"]:
+        if flag in updates:
+            analysis[flag] = updates[flag]
+
+    state["analysis"] = analysis
 

@@ -139,13 +139,120 @@ def display_summary(state: SolverState) -> None:
             out_dir = Path(__file__).resolve().parent / "Challenge" / _slug(Path(binary_path).stem)
             console.print(f"[dim]Saved to: {out_dir}/exploit.py[/dim]")
 
+        # Exploit verification status
+        attempts = state.get("exploit_attempts", 0)
+        verified = state.get("exploit_verified", False)
+
+        if verified:
+            console.print(f"[bold green]✓ Exploit verified! (attempts: {attempts})[/bold green]")
+        elif attempts > 0:
+            max_attempts = state.get("max_exploit_attempts", 3)
+            console.print(f"[yellow]✗ Exploit verification failed ({attempts}/{max_attempts} attempts)[/yellow]")
+            if state.get("exploit_error"):
+                error_preview = state["exploit_error"][:200]
+                if len(state["exploit_error"]) > 200:
+                    error_preview += "..."
+                console.print(f"[dim]Last error: {error_preview}[/dim]")
+
     # Flag
     if state.get("flag_detected"):
         console.print(f"[bold green]FLAG: {state.get('detected_flag')}[/bold green]")
 
 
-def run_solver(state: SolverState) -> SolverState:
-    """Run the PWN solver workflow"""
+def ask_continue(iteration: int, state: SolverState) -> bool:
+    """Ask user if they want to continue after certain iterations"""
+    readiness = state.get("exploit_readiness", {})
+    score = readiness.get("score", 0.0)
+
+    console.print(Panel(
+        f"[yellow]Iteration {iteration} completed[/yellow]\n"
+        f"Readiness Score: {score:.1%}\n"
+        f"Tasks Done: {len([t for t in state.get('tasks', []) if t.get('status') == 'done'])}/{len(state.get('tasks', []))}",
+        title="Progress Check",
+        style="yellow"
+    ))
+
+    console.print("[bold]Continue solving? (y/n/s)[/bold]")
+    console.print("  [green]y[/green] - Continue")
+    console.print("  [red]n[/red] - Stop and show summary")
+    console.print("  [cyan]s[/cyan] - Skip to exploit generation")
+
+    while True:
+        try:
+            choice = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+        if choice in ("y", "yes", ""):
+            return True
+        elif choice in ("n", "no"):
+            return False
+        elif choice in ("s", "skip"):
+            # Force exploit generation
+            state["loop"] = False
+            state["exploit_readiness"]["recommend_exploit"] = True
+            return True
+        else:
+            console.print("[yellow]Please enter y, n, or s[/yellow]")
+
+
+def ask_after_exploit(state: SolverState) -> str:
+    """Ask user what to do after exploit verification"""
+    verified = state.get("exploit_verified", False)
+    flag_detected = state.get("flag_detected", False)
+    attempts = state.get("exploit_attempts", 0)
+    max_attempts = state.get("max_exploit_attempts", 3)
+
+    if flag_detected:
+        console.print(Panel(
+            f"[bold green]FLAG FOUND: {state.get('detected_flag')}[/bold green]",
+            title="Success!",
+            style="green"
+        ))
+    elif verified:
+        console.print(Panel(
+            f"[green]Exploit verified (shell access detected)[/green]\n"
+            f"Attempts: {attempts}",
+            title="Exploit Success",
+            style="green"
+        ))
+    else:
+        console.print(Panel(
+            f"[yellow]Exploit verification failed[/yellow]\n"
+            f"Attempts: {attempts}/{max_attempts}",
+            title="Exploit Failed",
+            style="yellow"
+        ))
+
+    console.print("[bold]What would you like to do?[/bold]")
+    console.print("  [green]c[/green] - Continue (back to analysis)")
+    console.print("  [cyan]r[/cyan] - Retry exploit generation")
+    console.print("  [red]s[/red] - Stop and show summary")
+
+    while True:
+        try:
+            choice = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "stop"
+
+        if choice in ("c", "continue"):
+            return "continue"
+        elif choice in ("r", "retry"):
+            return "retry"
+        elif choice in ("s", "stop", ""):
+            return "stop"
+        else:
+            console.print("[yellow]Please enter c, r, or s[/yellow]")
+
+
+def run_solver(state: SolverState, ask_interval: int = 5) -> SolverState:
+    """
+    Run the PWN solver workflow
+
+    Args:
+        state: Initial solver state
+        ask_interval: Ask user every N iterations (0 = never ask)
+    """
     console.print(Panel("Starting PWN Solver", style="bold magenta"))
 
     # Create and run workflow
@@ -155,13 +262,86 @@ def run_solver(state: SolverState) -> SolverState:
     console.print("[cyan]Running workflow...[/cyan]\n")
 
     final_state = None
-    for output in app.stream(state):
-        # output is a dict with node_name: state
-        for node_name, node_state in output.items():
-            console.print(f"[dim]Completed: {node_name}[/dim]")
-            final_state = node_state
+    last_asked_iteration = 0
+
+    restart_workflow = False
+
+    while True:
+        restart_workflow = False
+
+        for output in app.stream(state):
+            if restart_workflow:
+                break
+
+            # output is a dict with node_name: state
+            for node_name, node_state in output.items():
+                console.print(f"[dim]Completed: {node_name}[/dim]")
+                final_state = node_state
+                state = node_state  # Update state for next iteration
+
+                # Check if we should ask user to continue (after feedback)
+                if ask_interval > 0 and node_name == "feedback":
+                    iteration = node_state.get("iteration_count", 0)
+
+                    # Ask every ask_interval iterations
+                    if iteration > 0 and iteration % ask_interval == 0 and iteration != last_asked_iteration:
+                        last_asked_iteration = iteration
+
+                        if not ask_continue(iteration, node_state):
+                            console.print("[yellow]Stopping by user request[/yellow]")
+                            return node_state
+
+                # Check after exploit verification (not in auto mode)
+                if ask_interval > 0 and node_name == "verify":
+                    choice = ask_after_exploit(node_state)
+
+                    if choice == "stop":
+                        console.print("[yellow]Stopping by user request[/yellow]")
+                        return node_state
+                    elif choice == "continue":
+                        # Go back to analysis loop
+                        console.print("[cyan]Returning to analysis...[/cyan]")
+                        state["loop"] = True
+                        state["exploit_readiness"]["recommend_exploit"] = False
+                        state["exploit_attempts"] = 0
+                        state["exploit_verified"] = False
+                        restart_workflow = True
+                        break
+                    elif choice == "retry":
+                        # Retry exploit generation
+                        console.print("[cyan]Retrying exploit generation...[/cyan]")
+                        state["loop"] = False
+                        state["exploit_readiness"]["recommend_exploit"] = True
+                        state["exploit_attempts"] = 0
+                        state["exploit_verified"] = False
+                        state["exploit_path"] = ""
+                        restart_workflow = True
+                        break
+
+        if not restart_workflow:
+            # Stream completed normally
+            break
+
+        # Restart workflow with updated state
+        app = create_app()
 
     return final_state or state
+
+
+def setup_docker_env(binary_path: str, port: int = 1337) -> bool:
+    """Setup Docker environment for exploit testing"""
+    from Tool.tool import Tool
+
+    console.print(Panel("Setting up Docker Environment", style="bold blue"))
+
+    try:
+        tool = Tool(binary_path=binary_path)
+        result = tool.Docker_setup(port=port)
+        console.print(result)
+        return "[SUCCESS]" in result
+    except Exception as e:
+        console.print(f"[red]Docker setup failed: {e}[/red]")
+        return False
 
 
 def main():
@@ -171,6 +351,11 @@ def main():
     parser.add_argument("--title", "-t", help="Challenge title")
     parser.add_argument("--description", "-d", help="Challenge description (direct mode)")
     parser.add_argument("--flag-format", "-f", help="Flag format", default="FLAG{...}")
+    parser.add_argument("--docker", action="store_true", help="Auto-setup Docker environment for testing")
+    parser.add_argument("--docker-port", type=int, default=1337, help="Docker port (default: 1337)")
+    parser.add_argument("--ask-interval", type=int, default=5, help="Ask to continue every N iterations (0=never)")
+    parser.add_argument("--max-attempts", type=int, default=3, help="Max exploit verification attempts (default: 3)")
+    parser.add_argument("--auto", action="store_true", help="Fully automatic mode (no user prompts during solving)")
     args = parser.parse_args()
 
     # Check environment
@@ -179,6 +364,7 @@ def main():
 
     # Initialize state
     state = init_state()
+    state["max_exploit_attempts"] = args.max_attempts
 
     # Get challenge info (interactive or from args)
     if args.binary:
@@ -205,9 +391,18 @@ def main():
         console.print(f"[red]Error: Binary not found: {binary_path}[/red]")
         sys.exit(1)
 
+    # Setup Docker if requested
+    if args.docker and binary_path:
+        if not setup_docker_env(binary_path, args.docker_port):
+            console.print("[yellow]Warning: Docker setup failed, continuing without Docker[/yellow]")
+        else:
+            console.print(f"[green]Docker environment ready on port {args.docker_port}[/green]")
+            state["docker_port"] = args.docker_port
+
     # Run solver
     try:
-        final_state = run_solver(state)
+        ask_interval = 0 if args.auto else args.ask_interval
+        final_state = run_solver(state, ask_interval=ask_interval)
         display_summary(final_state)
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
