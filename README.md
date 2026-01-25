@@ -19,21 +19,6 @@
 
 ---
 
-### 설치
-
-가상환경을 만들고 의존성을 설치하세요.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 최소 의존성(프로젝트에서 import 되는 것들)
-pip install -U pip
-pip install rich jinja2 langgraph openai google-generativeai
-```
-
----
-
 ### 환경 변수
 
 둘 중 하나만 설정하면 됩니다.
@@ -99,16 +84,4 @@ python3 main.py \
 - `readelf_YYYYMMDD_HHMMSS.txt`
 - `objdump_YYYYMMDD_HHMMSS.txt`
 - `exploit.py`
-
----
-
-### 트러블슈팅
-
-- **`bash: syntax error near unexpected token '('`**
-  - `-d` 인자에 괄호/공백이 포함되어 bash가 토큰으로 해석한 경우입니다.
-  - 해결: `-d '... ( ... ) ...'`처럼 **따옴표로 묶기**
-
-- **Jinja2 템플릿 에러**
-  - 프롬프트 템플릿에서 dict 키가 없을 때 발생할 수 있습니다.
-  - 최근에는 `INSTRUCTION_USER`에서 실행 이력을 `r.commands[0]`로 보여주도록 수정했습니다.
 
