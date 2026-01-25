@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+core*
+
+
+Challenge/
+**/Challenge/
+
+# Logs and binaries
+*.log
+*.bin
+*.txt
+.gdb_history
