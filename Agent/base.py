@@ -584,29 +584,222 @@ class BaseAgent(ABC):
 # JSON Response Parser
 # =============================================================================
 
+def _try_repair_json(json_str: str) -> str:
+    """
+    Attempt to repair truncated/malformed JSON.
+
+    Common issues:
+    - Unterminated strings (missing closing quote)
+    - Missing closing braces/brackets
+    - Trailing commas
+    """
+    repaired = json_str.strip()
+
+    # Remove trailing incomplete content after last complete value
+    # Find the last complete key-value pair
+    lines = repaired.split('\n')
+    valid_lines = []
+    brace_count = 0
+    bracket_count = 0
+    in_string = False
+    escape_next = False
+
+    for line in lines:
+        for char in line:
+            if escape_next:
+                escape_next = False
+                continue
+            if char == '\\':
+                escape_next = True
+                continue
+            if char == '"' and not escape_next:
+                in_string = not in_string
+            if not in_string:
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                elif char == '[':
+                    bracket_count += 1
+                elif char == ']':
+                    bracket_count -= 1
+        valid_lines.append(line)
+
+    repaired = '\n'.join(valid_lines)
+
+    # Check if string is unterminated (odd number of unescaped quotes)
+    quote_count = 0
+    i = 0
+    while i < len(repaired):
+        if repaired[i] == '\\' and i + 1 < len(repaired):
+            i += 2  # Skip escaped character
+            continue
+        if repaired[i] == '"':
+            quote_count += 1
+        i += 1
+
+    # If odd quotes, we have unterminated string - truncate at last complete line
+    if quote_count % 2 == 1:
+        # Find last line that ends with a complete value (", or number, or true/false/null, or ]/})
+        lines = repaired.split('\n')
+        for i in range(len(lines) - 1, -1, -1):
+            line = lines[i].rstrip()
+            # Check if line ends with complete value
+            if line.endswith((',', '",')):
+                # Remove trailing comma and reconstruct
+                repaired = '\n'.join(lines[:i+1])
+                if repaired.rstrip().endswith(','):
+                    repaired = repaired.rstrip()[:-1]  # Remove trailing comma
+                break
+            elif line.endswith(('}', ']', '"', 'true', 'false', 'null')) or \
+                 (line.rstrip(',').replace('.', '').replace('-', '').isdigit()):
+                repaired = '\n'.join(lines[:i+1])
+                break
+
+    # Remove trailing commas before closing braces/brackets
+    repaired = repaired.rstrip()
+    while repaired.endswith(','):
+        repaired = repaired[:-1].rstrip()
+
+    # Count and add missing braces/brackets
+    open_braces = repaired.count('{') - repaired.count('}')
+    open_brackets = repaired.count('[') - repaired.count(']')
+
+    # Add missing closing characters
+    repaired += ']' * max(0, open_brackets)
+    repaired += '}' * max(0, open_braces)
+
+    return repaired
+
+
+def _extract_partial_data(text: str) -> Dict[str, Any]:
+    """
+    Extract key-value pairs from partially valid JSON using regex.
+    Fallback when JSON repair fails.
+    """
+    import re
+    result = {}
+
+    # Extract simple string fields: "key": "value"
+    string_pattern = r'"(\w+)"\s*:\s*"([^"]*)"'
+    for match in re.finditer(string_pattern, text):
+        key, value = match.groups()
+        result[key] = value
+
+    # Extract boolean fields: "key": true/false
+    bool_pattern = r'"(\w+)"\s*:\s*(true|false)'
+    for match in re.finditer(bool_pattern, text):
+        key, value = match.groups()
+        result[key] = value == 'true'
+
+    # Extract number fields: "key": 123 or "key": 0.5
+    number_pattern = r'"(\w+)"\s*:\s*(-?\d+\.?\d*)'
+    for match in re.finditer(number_pattern, text):
+        key, value = match.groups()
+        try:
+            result[key] = float(value) if '.' in value else int(value)
+        except ValueError:
+            pass
+
+    # Try to extract exploit_code specially (multiline)
+    code_match = re.search(r'"exploit_code"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
+    if code_match:
+        code = code_match.group(1)
+        # Unescape common escapes
+        code = code.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+        result['exploit_code'] = code
+
+    return result
+
+
+def is_response_truncated(text: str) -> bool:
+    """
+    Detect if LLM response was likely truncated.
+
+    Signs of truncation:
+    - JSON block opened but not closed
+    - String started but not closed
+    - Response ends mid-sentence
+    """
+    # Check for unclosed JSON
+    open_braces = text.count('{') - text.count('}')
+    open_brackets = text.count('[') - text.count(']')
+
+    if open_braces > 0 or open_brackets > 0:
+        return True
+
+    # Check for unclosed code blocks
+    code_blocks = text.count('```')
+    if code_blocks % 2 == 1:
+        return True
+
+    # Check if ends mid-JSON value
+    stripped = text.rstrip()
+    if stripped.endswith((',', ':', '"', '\\')):
+        return True
+
+    return False
+
+
 def parse_json_response(text: str) -> Dict[str, Any]:
-    """Extract JSON from LLM response."""
+    """
+    Extract JSON from LLM response with robust error handling.
+
+    Handles:
+    - JSON in ```json``` blocks
+    - Raw JSON objects
+    - Truncated/incomplete JSON (attempts repair)
+    - Partial extraction when repair fails
+    """
     # Try to find JSON block
     if "```json" in text:
         start = text.find("```json") + 7
         end = text.find("```", start)
-        json_str = text[start:end].strip()
+        if end == -1:  # No closing ```, truncated response
+            json_str = text[start:].strip()
+        else:
+            json_str = text[start:end].strip()
     elif "```" in text:
         start = text.find("```") + 3
         end = text.find("```", start)
-        json_str = text[start:end].strip()
+        if end == -1:
+            json_str = text[start:].strip()
+        else:
+            json_str = text[start:end].strip()
     else:
         # Try to find JSON object directly
         start = text.find("{")
         end = text.rfind("}") + 1
         if start >= 0 and end > start:
             json_str = text[start:end]
+        elif start >= 0:
+            # Has opening { but no closing }
+            json_str = text[start:]
         else:
             json_str = text.strip()
-    
+
+    # Attempt 1: Direct parse
     try:
         return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        console.print(f"[red]JSON parse error: {e}[/red]")
-        console.print(f"[dim]Raw text: {text[:500]}...[/dim]")
-        return {}
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: Try to repair truncated JSON
+    try:
+        repaired = _try_repair_json(json_str)
+        result = json.loads(repaired)
+        console.print(f"[yellow]JSON repaired successfully[/yellow]")
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 3: Extract partial data using regex
+    partial = _extract_partial_data(text)
+    if partial:
+        console.print(f"[yellow]Extracted partial JSON data: {list(partial.keys())}[/yellow]")
+        return partial
+
+    # Final fallback
+    console.print(f"[red]JSON parse failed completely[/red]")
+    console.print(f"[dim]Raw text: {text[:500]}...[/dim]")
+    return {"_parse_error": True, "_raw_text": text[:1000]}

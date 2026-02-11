@@ -378,6 +378,227 @@ def Refine_node(
     return state
 
 
+def Crash_analysis_node(
+    state: State,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> State:
+    """
+    Crash Analysis Node - 익스플로잇 실패 시 Core dump 및 GDB 분석
+
+    - Core dump 파일 찾기 및 분석
+    - GDB로 크래시 원인 분석
+    - 실패 원인을 state에 저장하여 Plan에서 활용
+    """
+    console.print(Panel("Crash Analysis", style="bold red"))
+
+    import re
+    import os
+
+    binary_path = state.get("binary_path", "")
+    exploit_error = state.get("exploit_error", "")
+    exploit_path = state.get("exploit_path", "")
+
+    if not binary_path:
+        console.print("[red]No binary path set[/red]")
+        return state
+
+    workdir = Path(binary_path).resolve().parent
+    challenge_dir = _challenge_dir_for_state(state)
+
+    crash_analysis = {
+        "performed": True,
+        "core_found": False,
+        "crash_reason": "",
+        "registers": {},
+        "stack_state": "",
+        "exploit_issues": [],
+        "recommendations": [],
+    }
+
+    # 1. Core dump 파일 찾기
+    core_files = list(workdir.glob("core*")) + list(Path("/tmp").glob("core*"))
+    core_file = None
+
+    if core_files:
+        # 가장 최근 core 파일 선택
+        core_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        core_file = core_files[0]
+        crash_analysis["core_found"] = True
+        console.print(f"[green]Found core dump: {core_file}[/green]")
+
+    # 2. GDB 분석 실행
+    gdb_analysis = ""
+
+    if core_file and core_file.exists():
+        # Core dump 분석
+        gdb_commands = [
+            "set pagination off",
+            f"file {binary_path}",
+            f"core-file {core_file}",
+            "info registers",
+            "bt",  # backtrace
+            "x/20gx $rsp",  # stack
+            "x/10i $rip",   # instructions at crash
+        ]
+
+        cmd = ["gdb", "-q", "-nx", "-batch"]
+        for c in gdb_commands:
+            cmd += ["-ex", c]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            gdb_analysis = result.stdout or ""
+            if result.stderr:
+                gdb_analysis += "\n--- STDERR ---\n" + result.stderr
+        except Exception as e:
+            gdb_analysis = f"GDB analysis failed: {e}"
+
+        console.print(Panel(gdb_analysis[:2000], title="GDB Core Analysis", border_style="red"))
+    else:
+        # Core가 없으면 exploit 에러 메시지 분석
+        console.print("[yellow]No core dump found. Analyzing exploit error...[/yellow]")
+        gdb_analysis = f"No core dump available.\n\nExploit error output:\n{exploit_error}"
+
+    crash_analysis["gdb_output"] = gdb_analysis
+
+    # 3. 크래시 원인 분석 (패턴 매칭)
+    issues = []
+    recommendations = []
+
+    # 레지스터 값 파싱
+    rip_match = re.search(r'rip\s+0x([0-9a-fA-F]+)', gdb_analysis)
+    rsp_match = re.search(r'rsp\s+0x([0-9a-fA-F]+)', gdb_analysis)
+    rbp_match = re.search(r'rbp\s+0x([0-9a-fA-F]+)', gdb_analysis)
+
+    if rip_match:
+        rip = rip_match.group(1)
+        crash_analysis["registers"]["rip"] = f"0x{rip}"
+
+        # RIP 분석
+        rip_int = int(rip, 16)
+
+        # 잘못된 주소로 점프
+        if rip_int < 0x400000 or rip_int > 0x7fffffffffff:
+            issues.append(f"RIP points to invalid address: 0x{rip}")
+            recommendations.append("Check offset calculation - RIP is corrupted")
+
+        # cyclic 패턴 감지 (0x616161XX 형태)
+        if 0x61616161 <= (rip_int & 0xffffffff) <= 0x6161617a:
+            issues.append("RIP contains cyclic pattern - offset might be wrong")
+            # 패턴에서 오프셋 계산 시도
+            try:
+                from pwn import cyclic_find
+                offset = cyclic_find(rip_int & 0xffffffff, n=4)
+                if offset != -1:
+                    recommendations.append(f"Cyclic pattern detected. Calculated offset: {offset}")
+            except:
+                recommendations.append("Install pwntools to auto-calculate offset from cyclic pattern")
+
+    if rsp_match:
+        crash_analysis["registers"]["rsp"] = f"0x{rsp_match.group(1)}"
+
+    if rbp_match:
+        crash_analysis["registers"]["rbp"] = f"0x{rbp_match.group(1)}"
+
+    # 에러 메시지 분석
+    error_lower = exploit_error.lower()
+
+    if "segmentation fault" in error_lower or "sigsegv" in error_lower:
+        issues.append("Segmentation fault - likely wrong address or offset")
+
+    if "stack smashing" in error_lower or "stack_chk_fail" in error_lower:
+        issues.append("Stack canary detected - need to leak and preserve canary")
+        recommendations.append("Find format string or other leak to get canary value")
+
+    if "timeout" in error_lower:
+        issues.append("Exploit timed out - might be stuck or wrong interaction")
+        recommendations.append("Check recv/send sequence matches binary behavior")
+
+    if "eof" in error_lower or "got eof" in error_lower:
+        issues.append("Connection closed unexpectedly")
+        recommendations.append("Binary crashed or rejected input - check payload")
+
+    if "broken pipe" in error_lower:
+        issues.append("Broken pipe - binary crashed before sending data")
+        recommendations.append("Exploit crashes too early - verify offset and addresses")
+
+    # Alignment 문제 감지
+    if "movaps" in gdb_analysis.lower() or "alignment" in error_lower:
+        issues.append("Stack alignment issue (SIGSEGV on movaps)")
+        recommendations.append("Add extra 'ret' gadget before function call for 16-byte alignment")
+
+    # 기본 권장사항
+    if not recommendations:
+        recommendations.append("Verify offset with cyclic pattern test")
+        recommendations.append("Check if addresses are correct (PIE? ASLR?)")
+        recommendations.append("Ensure stack is 16-byte aligned before calls")
+
+    crash_analysis["exploit_issues"] = issues
+    crash_analysis["recommendations"] = recommendations
+    crash_analysis["crash_reason"] = "; ".join(issues) if issues else "Unknown crash reason"
+
+    # 4. 결과 표시
+    if issues:
+        console.print("[bold red]Detected Issues:[/bold red]")
+        for issue in issues:
+            console.print(f"  • {issue}")
+
+    if recommendations:
+        console.print("[bold yellow]Recommendations:[/bold yellow]")
+        for rec in recommendations:
+            console.print(f"  → {rec}")
+
+    # 5. State에 저장
+    state["crash_analysis"] = crash_analysis
+
+    # Feedback에 전달할 정보 업데이트
+    state["exploit_failure_reason"] = crash_analysis["crash_reason"]
+
+    # 분석 문서에 실패 정보 추가
+    if "analysis" not in state:
+        state["analysis"] = init_analysis()
+
+    state["analysis"]["last_exploit_failure"] = {
+        "crash_reason": crash_analysis["crash_reason"],
+        "issues": issues,
+        "recommendations": recommendations,
+        "registers": crash_analysis["registers"],
+    }
+
+    # 결과 파일 저장
+    try:
+        analysis_text = f"""=== CRASH ANALYSIS ===
+
+Core dump found: {crash_analysis['core_found']}
+Crash reason: {crash_analysis['crash_reason']}
+
+Registers:
+{crash_analysis.get('registers', {})}
+
+Issues:
+{chr(10).join('- ' + i for i in issues)}
+
+Recommendations:
+{chr(10).join('- ' + r for r in recommendations)}
+
+=== GDB Output ===
+{gdb_analysis}
+
+=== Exploit Error ===
+{exploit_error}
+"""
+        (challenge_dir / "crash_analysis.txt").write_text(analysis_text, encoding="utf-8")
+    except Exception:
+        pass
+
+    # Core 파일 정리 (선택적)
+    # if core_file and core_file.exists():
+    #     core_file.unlink()
+
+    return state
+
+
 # =============================================================================
 # Routing Functions (for LangGraph)
 # =============================================================================
@@ -397,7 +618,7 @@ def should_continue(state: State) -> str:
 
 
 def route_after_verify(state: State) -> str:
-    """Verify 후 라우팅 결정."""
+    """Verify 후 라우팅 결정 - Crash Analysis로 이동."""
     # 성공
     if state.get("flag_detected") or state.get("exploit_verified"):
         return "end"
@@ -410,8 +631,9 @@ def route_after_verify(state: State) -> str:
         console.print(f"[red]Max exploit attempts ({max_attempts}) reached[/red]")
         return "end"
 
-    # 다시 시도
-    return "refine"
+    # 실패 - crash analysis로 이동 후 plan으로 돌아감
+    console.print("[yellow]Exploit failed - going to crash analysis...[/yellow]")
+    return "crash_analysis"
 
 
 # =============================================================================

