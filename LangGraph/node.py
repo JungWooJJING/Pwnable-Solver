@@ -1,6 +1,12 @@
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+# Ensure project root is in sys.path
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from rich.console import Console
 from rich.panel import Panel
@@ -40,7 +46,7 @@ def _challenge_dir_for_state(state: State) -> Path:
     root = project_root / "Challenge"
     binary_path = state.get("binary_path", "") or ""
     name = Path(binary_path).stem if binary_path else "unknown"
-    out_dir = root / _slug(name)
+    out_dir = root / f"{_slug(name)}_output"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -122,7 +128,7 @@ def Plan_node(
     """
     Plan Agent Node
 
-    - First iteration: Initialize with directory listing
+    - First iteration: Auto-execute Phase 1 RECON (checksec, ghidra, ls)
     - Subsequent iterations: Analyze feedback and create/update tasks
     """
     console.print(Panel("Plan Node", style="bold magenta"))
@@ -149,7 +155,7 @@ def Plan_node(
             try:
                 out_dir = _challenge_dir_for_state(state)
                 (out_dir / "directory_listing.txt").write_text(
-                    (ls_result.stdout or "") + 
+                    (ls_result.stdout or "") +
                     ("\n\n--- STDERR ---\n" + (ls_result.stderr or "") if ls_result.stderr else ""),
                     encoding="utf-8",
                     errors="replace",
@@ -163,6 +169,11 @@ def Plan_node(
 
         state["loop"] = True
         state["iteration_count"] = 1
+
+        # --- Phase 1 RECON: Auto-execute checksec + ghidra ---
+        if binary_path:
+            _run_phase1_recon(state, binary_path)
+
     else:
         state["iteration_count"] = state.get("iteration_count", 0) + 1
 
@@ -173,6 +184,91 @@ def Plan_node(
     state = agent.run(state)
 
     return state
+
+
+def _run_phase1_recon(state: State, binary_path: str) -> None:
+    """
+    Auto-execute Phase 1 RECON tools (no LLM needed).
+
+    Runs checksec and ghidra_main, parses results deterministically,
+    and populates the Analysis Document directly.
+    """
+    from Tool.tool import Tool
+    from Agent.parsing import parse_checksec_output
+    from LangGraph.state import merge_analysis_updates, add_run, TaskRun
+    import time as _time
+
+    console.print("[cyan]Phase 1 RECON: Auto-executing checksec + ghidra...[/cyan]")
+
+    try:
+        tool = Tool(binary_path=binary_path)
+    except Exception as e:
+        console.print(f"[red]Tool init failed: {e}[/red]")
+        return
+
+    # --- Checksec ---
+    try:
+        checksec_raw = tool.Checksec()
+        checksec_data = parse_checksec_output(str(checksec_raw))
+        merge_analysis_updates(state, {"checksec": checksec_data})
+        console.print(Panel(checksec_data["result"], title="Phase 1: Checksec", border_style="green"))
+
+        # Get KB recommendation
+        try:
+            from Store.knowledge import get_checksec_guide
+            guide = get_checksec_guide(checksec_data)
+            if guide.get("recommended"):
+                top = guide["recommended"][0]
+                strategy = f"Recommended: {top.get('name', '')} ({top.get('description', '')})"
+                merge_analysis_updates(state, {"strategy": strategy})
+                console.print(f"[green]KB Strategy: {strategy}[/green]")
+        except Exception:
+            pass
+
+        add_run(state, {
+            "run_id": f"recon_checksec_{int(_time.time()*1000)}",
+            "task_id": "phase1_checksec",
+            "commands": ["Checksec()"],
+            "success": True,
+            "stdout": str(checksec_raw),
+            "stderr": "",
+            "started_at": _time.time(),
+            "finished_at": _time.time(),
+            "key_findings": [f"Checksec: {checksec_data['result']}"],
+        })
+    except Exception as e:
+        console.print(f"[yellow]Checksec failed: {e}[/yellow]")
+
+    # --- Ghidra Main ---
+    try:
+        ghidra_raw = tool.Ghidra_main(main_only=True)
+        if ghidra_raw and not str(ghidra_raw).startswith("Error:"):
+            merge_analysis_updates(state, {
+                "decompile": {
+                    "done": True,
+                    "functions": [{"name": "main", "address": "", "code": str(ghidra_raw)[:3000]}],
+                }
+            })
+            preview = str(ghidra_raw)[:500]
+            console.print(Panel(preview, title="Phase 1: Ghidra Main", border_style="green"))
+
+            add_run(state, {
+                "run_id": f"recon_ghidra_{int(_time.time()*1000)}",
+                "task_id": "phase1_ghidra",
+                "commands": ["Ghidra_main(main_only=True)"],
+                "success": True,
+                "stdout": str(ghidra_raw)[:5000],
+                "stderr": "",
+                "started_at": _time.time(),
+                "finished_at": _time.time(),
+                "key_findings": ["Main function decompiled"],
+            })
+        else:
+            console.print(f"[yellow]Ghidra returned: {str(ghidra_raw)[:200]}[/yellow]")
+    except Exception as e:
+        console.print(f"[yellow]Ghidra failed: {e}[/yellow]")
+
+    console.print("[green]Phase 1 RECON complete - Plan Agent starts at Phase 2[/green]")
 
 
 def Instruction_node(
@@ -331,17 +427,35 @@ def Verify_node(
                 state.setdefault("all_detected_flags", []).append(flag)
             return state
 
-    # 쉘 획득 여부 확인 (interactive shell indicators)
-    shell_indicators = ["$ ", "# ", "sh-", "bash", "/bin/sh", "id=", "uid="]
-    if any(indicator in combined.lower() for indicator in shell_indicators):
-        console.print("[green]Shell access detected![/green]")
+    # 쉘 획득 여부 확인: exploit 스크립트가 쉘에서 'id' 명령을 실행하고
+    # 그 결과(uid=)를 출력했는지 확인. 단순 문자열 매칭은 pwntools debug 로그에서
+    # false positive가 발생하므로, "SHELL_VERIFIED" 마커 또는 실제 uid= 패턴만 신뢰.
+    shell_verified_marker = "SHELL_VERIFIED"
+    uid_pattern = re.search(r"uid=\d+", combined)
+    if shell_verified_marker in combined or uid_pattern:
+        console.print("[green]Shell access detected (verified via 'id' command)![/green]")
         state["exploit_verified"] = True
         return state
 
-    # 실패 - 에러 저장
+    # 실패 - 에러 저장 + 히스토리 누적
     console.print(f"[yellow]Exploit attempt {attempt} failed[/yellow]")
     state["exploit_error"] = combined
     state["exploit_verified"] = False
+
+    # 실패 히스토리 누적 (exploit agent가 같은 실수 반복하지 않도록)
+    exploit_code = ""
+    if exploit_path and Path(exploit_path).exists():
+        try:
+            exploit_code = Path(exploit_path).read_text(encoding="utf-8")
+        except Exception:
+            pass
+
+    failure_record = {
+        "attempt": attempt,
+        "error_summary": combined[:1000],
+        "exploit_snippet": exploit_code[:500] if exploit_code else "",
+    }
+    state.setdefault("exploit_failure_history", []).append(failure_record)
 
     return state
 
@@ -549,7 +663,42 @@ def Crash_analysis_node(
         for rec in recommendations:
             console.print(f"  → {rec}")
 
-    # 5. State에 저장
+    # 5. LLM으로 crash 분류 (minor fix vs strategy change)
+    from Agent.base import BaseAgent, parse_json_response
+
+    class CrashClassifier(BaseAgent):
+        def __init__(self, **kwargs):
+            super().__init__(name="CrashClassifier", **kwargs)
+        def run(self, state):
+            return state
+
+    classifier = CrashClassifier(model=model, provider=provider)
+    classifier.set_system_prompt(
+        "You classify exploit crash reports. Output STRICT JSON only.\n"
+        '{"fix_type": "minor" or "strategy", "reasoning": "brief explanation"}\n\n'
+        "minor = offset wrong, alignment issue, wrong address, null byte, timeout, EOF, broken pipe, "
+        "small calculation error. These can be fixed by adjusting values.\n"
+        "strategy = wrong exploitation technique, missing leak, wrong target function, "
+        "fundamentally wrong approach. Needs full re-planning."
+    )
+    classifier.add_user_message(
+        f"Issues: {'; '.join(issues)}\n"
+        f"Recommendations: {'; '.join(recommendations)}\n"
+        f"Registers: {crash_analysis['registers']}\n"
+        f"Error excerpt: {exploit_error[:500]}"
+    )
+    try:
+        classify_response = classifier.call_llm()
+        classify_parsed = parse_json_response(classify_response)
+        fix_type = classify_parsed.get("fix_type", "minor")
+        console.print(f"[cyan]LLM Crash Classification: {fix_type}[/cyan]")
+        console.print(f"[dim]Reasoning: {classify_parsed.get('reasoning', '')}[/dim]")
+    except Exception:
+        fix_type = "minor"  # fallback to minor
+
+    crash_analysis["fix_type"] = fix_type
+
+    # 6. State에 저장
     state["crash_analysis"] = crash_analysis
 
     # Feedback에 전달할 정보 업데이트
@@ -634,6 +783,279 @@ def route_after_verify(state: State) -> str:
     # 실패 - crash analysis로 이동 후 plan으로 돌아감
     console.print("[yellow]Exploit failed - going to crash analysis...[/yellow]")
     return "crash_analysis"
+
+
+# =============================================================================
+# Staged Exploit Nodes (단계별 익스플로잇)
+# =============================================================================
+
+def Stage_identify_node(
+    state: State,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> State:
+    """
+    Stage Identify Node - 분석 결과 기반으로 exploit 단계 식별.
+    analysis loop 종료 후 한 번 실행.
+    """
+    console.print(Panel("Stage Identify", style="bold magenta"))
+
+    from Agent.exploit import StageIdentifierAgent
+
+    agent = StageIdentifierAgent(model=model, provider=provider)
+    state = agent.run(state)
+    return state
+
+
+def Stage_exploit_node(
+    state: State,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> State:
+    """
+    Stage Exploit Node - 현재 단계의 exploit 코드 생성.
+    이전 verified 단계 코드를 포함한 완전한 스크립트.
+    """
+    staged = state.get("staged_exploit", {})
+    stages = staged.get("stages", [])
+    current_idx = staged.get("current_stage_index", 0)
+
+    if current_idx >= len(stages):
+        console.print("[red]All stages complete or no stages defined[/red]")
+        return state
+
+    console.print(Panel(
+        f"Stage Exploit ({current_idx+1}/{len(stages)})",
+        style="bold red"
+    ))
+
+    from Agent.exploit import StageExploitAgent
+
+    agent = StageExploitAgent(model=model, provider=provider)
+    state = agent.run(state)
+
+    console.print(f"[green]Completed: Stage {current_idx+1} code generation[/green]")
+    return state
+
+
+def Stage_verify_node(
+    state: State,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> State:
+    """
+    Stage Verify Node - 현재 단계의 스크립트를 실행하고 검증.
+
+    중간 단계: verification_marker in stdout → verified
+    최종 단계: SHELL_VERIFIED or uid=\\d+ → verified + exploit_verified
+    """
+    import re
+    import os
+
+    console.print(Panel("Stage Verify", style="bold yellow"))
+
+    staged = state.get("staged_exploit", {})
+    stages = staged.get("stages", [])
+    current_idx = staged.get("current_stage_index", 0)
+
+    if current_idx >= len(stages):
+        console.print("[red]No stage to verify[/red]")
+        return state
+
+    current_stage = stages[current_idx]
+    exploit_path = state.get("exploit_path", "")
+
+    if not exploit_path or not Path(exploit_path).exists():
+        console.print("[red]No exploit file to run[/red]")
+        current_stage["verified"] = False
+        current_stage["error"] = "No exploit file found"
+        stages[current_idx] = current_stage
+        state["staged_exploit"]["stages"] = stages
+        return state
+
+    console.print(f"[cyan]Running Stage {current_idx+1}: {current_stage['stage_id']}...[/cyan]")
+
+    # Run the script
+    try:
+        env = os.environ.copy()
+        result = subprocess.run(
+            ["python3", exploit_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(Path(exploit_path).parent),
+            env=env,
+        )
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        combined = stdout + ("\n--- STDERR ---\n" + stderr if stderr else "")
+    except subprocess.TimeoutExpired:
+        combined = "TIMEOUT: Exploit timed out after 60 seconds"
+        console.print(f"[red]{combined}[/red]")
+        current_stage["verified"] = False
+        current_stage["error"] = combined
+        stages[current_idx] = current_stage
+        state["staged_exploit"]["stages"] = stages
+        return state
+    except Exception as e:
+        combined = f"ERROR: {str(e)}"
+        console.print(f"[red]{combined}[/red]")
+        current_stage["verified"] = False
+        current_stage["error"] = combined
+        stages[current_idx] = current_stage
+        state["staged_exploit"]["stages"] = stages
+        return state
+
+    # Display output
+    preview = combined[:1500] + "..." if len(combined) > 1500 else combined
+    console.print(Panel(preview, title=f"Stage {current_idx+1} Output", border_style="cyan"))
+
+    current_stage["output"] = combined
+
+    # Check for flag in any stage
+    flag_patterns = [r"flag\{[^}]+\}", r"FLAG\{[^}]+\}", r"ctf\{[^}]+\}", r"CTF\{[^}]+\}"]
+    flag_format = state.get("challenge", {}).get("flag_format", "")
+    if flag_format and "{" in flag_format:
+        prefix = flag_format.split("{")[0]
+        if prefix:
+            flag_patterns.insert(0, rf"{re.escape(prefix)}\{{[^}}]+\}}")
+
+    for pattern in flag_patterns:
+        match = re.search(pattern, combined, re.IGNORECASE)
+        if match:
+            flag = match.group()
+            console.print(f"[bold green]FLAG FOUND: {flag}[/bold green]")
+            state["flag_detected"] = True
+            state["detected_flag"] = flag
+            state["exploit_verified"] = True
+            current_stage["verified"] = True
+            state["staged_exploit"]["all_stages_verified"] = True
+            if flag not in state.get("all_detected_flags", []):
+                state.setdefault("all_detected_flags", []).append(flag)
+            stages[current_idx] = current_stage
+            state["staged_exploit"]["stages"] = stages
+            return state
+
+    # Verify based on marker
+    marker = current_stage.get("verification_marker", "")
+
+    if marker == "SHELL_VERIFIED":
+        # Final stage: check for actual shell verification
+        uid_match = re.search(r"uid=\d+", combined)
+        if "SHELL_VERIFIED" in combined or uid_match:
+            console.print(f"[bold green]Stage {current_idx+1} VERIFIED (shell obtained!)[/bold green]")
+            current_stage["verified"] = True
+            state["exploit_verified"] = True
+            state["staged_exploit"]["all_stages_verified"] = True
+        else:
+            console.print(f"[red]Stage {current_idx+1} FAILED (no shell)[/red]")
+            current_stage["verified"] = False
+            current_stage["error"] = combined
+    else:
+        # Intermediate stage: check for marker string
+        # Also check for explicit STAGE_FAILED marker (code validated and found invalid result)
+        has_marker = marker and marker in combined
+        has_stage_failed = "STAGE_FAILED" in combined
+
+        if has_stage_failed:
+            # Code explicitly reported failure (e.g., leaked value validation failed)
+            console.print(f"[red]Stage {current_idx+1} FAILED (code reported STAGE_FAILED)[/red]")
+            current_stage["verified"] = False
+            current_stage["error"] = combined
+        elif has_marker:
+            # Additional heuristic: for leak stages, check if a valid address is near the marker
+            is_leak_stage = current_stage.get("stage_id", "").lower() in ("leak", "canary_leak")
+            if is_leak_stage:
+                # Extract the marker line and nearby context
+                marker_line = ""
+                for line in combined.split("\n"):
+                    if marker in line:
+                        marker_line = line
+                        break
+                # Check if marker line contains a hex value that looks valid (not 0x0 or very small)
+                addr_match = re.search(r"0x([0-9a-fA-F]+)", marker_line)
+                if addr_match:
+                    addr_val = int(addr_match.group(1), 16)
+                    if addr_val < 0x1000:
+                        console.print(f"[red]Stage {current_idx+1} FAILED (leaked value 0x{addr_val:x} is too small — likely invalid)[/red]")
+                        current_stage["verified"] = False
+                        current_stage["error"] = f"Leaked value 0x{addr_val:x} is invalid (too small)\n" + combined
+                    else:
+                        console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, addr=0x{addr_val:x})[/bold green]")
+                        current_stage["verified"] = True
+                else:
+                    # Marker found but no hex value — still accept but warn
+                    console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found)[/bold green]")
+                    current_stage["verified"] = True
+            else:
+                console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found)[/bold green]")
+                current_stage["verified"] = True
+        else:
+            console.print(f"[red]Stage {current_idx+1} FAILED (marker '{marker}' not found)[/red]")
+            current_stage["verified"] = False
+            current_stage["error"] = combined
+
+    stages[current_idx] = current_stage
+    state["staged_exploit"]["stages"] = stages
+
+    return state
+
+
+def Stage_refine_node(
+    state: State,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> State:
+    """
+    Stage Refine Node - 실패한 단계의 코드만 수정.
+    """
+    console.print(Panel("Stage Refine", style="bold orange1"))
+
+    staged = state.get("staged_exploit", {})
+    stages = staged.get("stages", [])
+    current_idx = staged.get("current_stage_index", 0)
+
+    if current_idx >= len(stages):
+        return state
+
+    current_stage = stages[current_idx]
+    current_stage["refinement_attempts"] = current_stage.get("refinement_attempts", 0) + 1
+
+    from Agent.exploit import StageRefinerAgent
+
+    refiner = StageRefinerAgent(model=model, provider=provider)
+    state = refiner.run(
+        state=state,
+        stage=current_stage,
+        error_output=current_stage.get("error", ""),
+    )
+
+    return state
+
+
+def Stage_advance_node(
+    state: State,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> State:
+    """
+    Stage Advance Node - 다음 단계로 이동 (current_stage_index += 1).
+    """
+    staged = state.get("staged_exploit", {})
+    old_idx = staged.get("current_stage_index", 0)
+    staged["current_stage_index"] = old_idx + 1
+    state["staged_exploit"] = staged
+
+    stages = staged.get("stages", [])
+    new_idx = staged["current_stage_index"]
+
+    if new_idx < len(stages):
+        next_stage = stages[new_idx]
+        console.print(f"[cyan]Advancing to Stage {new_idx+1}: {next_stage['stage_id']} — {next_stage['description']}[/cyan]")
+    else:
+        console.print("[green]All stages complete![/green]")
+
+    return state
 
 
 # =============================================================================

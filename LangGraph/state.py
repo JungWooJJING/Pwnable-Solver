@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
 import time
 
 AgentName = Literal["plan", "instruction", "parsing", "feedback", "exploit"]
@@ -72,6 +72,28 @@ class AgentOutput(TypedDict, total=False):
     text: str                   # 원문(짧게 유지 권장)
     json: Dict[str, Any]         # 파싱된 결과(있으면)
     created_at: float
+
+
+# =========================
+# Staged Exploit (단계별 익스플로잇)
+# =========================
+
+class ExploitStage(TypedDict, total=False):
+    stage_id: str               # "leak", "write", "trigger"
+    stage_index: int            # 0, 1, 2
+    description: str            # "Leak libc via puts@GOT"
+    code: str                   # 전체 실행 가능 스크립트
+    verified: bool              # 이 단계 검증 완료?
+    verification_marker: str    # "STAGE1_OK" or "SHELL_VERIFIED"
+    output: str                 # 마지막 실행 stdout
+    error: str                  # 실패 시 에러
+    refinement_attempts: int    # 수정 시도 횟수
+
+
+class StagedExploitPlan(TypedDict, total=False):
+    stages: List[ExploitStage]
+    current_stage_index: int
+    all_stages_verified: bool
 
 
 # =========================
@@ -187,6 +209,9 @@ class SolverState(TypedDict, total=False):
     exploit_error: str                  # 마지막 에러 출력
     exploit_path: str                   # 저장된 exploit.py 경로
 
+    # --- Staged Exploit (단계별 익스플로잇) ---
+    staged_exploit: StagedExploitPlan
+
 
 # =========================
 # State 초기화
@@ -264,6 +289,13 @@ def init_state(**overrides: Any) -> SolverState:
         "exploit_verified": False,
         "exploit_error": "",
         "exploit_path": "",
+
+        # Staged Exploit
+        "staged_exploit": {
+            "stages": [],
+            "current_stage_index": 0,
+            "all_stages_verified": False,
+        },
     }
     state.update(overrides)
     return state
@@ -562,4 +594,168 @@ def merge_analysis_updates(state: SolverState, updates: Dict[str, Any]) -> None:
             analysis[flag] = updates[flag]
 
     state["analysis"] = analysis
+
+
+# =========================
+# Code-based Readiness Score
+# =========================
+
+def compute_readiness(analysis: Analysis, runs: Optional[List] = None) -> Tuple[float, List[str], List[str]]:
+    """
+    Compute exploit readiness score deterministically from Analysis Document.
+
+    Returns:
+        (score, completed_components, missing_components)
+
+    Scoring:
+        Tier 1 (+0.25): checksec done, vuln found, vuln type known
+        Tier 2 (+0.25): offset/detail known, control primitive identified
+        Tier 3 (+0.25): gadgets (if NX), leak method (if needed), libc (if needed)
+        Tier 4 (+0.15): dynamic verification (Pwndbg executed)
+        Tier 5 (+0.1): strategy clear
+    """
+    completed: List[str] = []
+    missing: List[str] = []
+    score = 0.0
+
+    checksec = analysis.get("checksec", {})
+    vulns = analysis.get("vulnerabilities", [])
+    gadgets = analysis.get("gadgets", [])
+    libc = analysis.get("libc", {})
+    strategy = analysis.get("strategy", "")
+
+    nx = checksec.get("nx", False) if isinstance(checksec.get("result"), str) else False
+    # Try to parse nx from result string if not set as bool
+    result_str = str(checksec.get("result", "")).lower()
+    if "nx enabled" in result_str or "nx:true" in result_str.replace(" ", ""):
+        nx = True
+
+    has_canary = False
+    if "canary found" in result_str and "no canary" not in result_str:
+        has_canary = True
+
+    # --- Tier 1: Basic Requirements (+0.25) ---
+    tier1_items = 3
+    tier1_done = 0
+
+    if checksec.get("done"):
+        completed.append("protections_analyzed")
+        tier1_done += 1
+    else:
+        missing.append("protections_analyzed")
+
+    if vulns:
+        completed.append("vulnerability_found")
+        tier1_done += 1
+    else:
+        missing.append("vulnerability_found")
+
+    if any(v.get("type") for v in vulns):
+        completed.append("vulnerability_type_known")
+        tier1_done += 1
+    else:
+        missing.append("vulnerability_type_known")
+
+    score += 0.25 * (tier1_done / tier1_items)
+
+    # --- Tier 2: Exploitation Details (+0.25) ---
+    tier2_items = 2
+    tier2_done = 0
+
+    # Check for offset/buffer_size/fmt_offset
+    has_detail = False
+    for v in vulns:
+        if v.get("estimated_offset") or v.get("buffer_size") or v.get("offset"):
+            has_detail = True
+            break
+        if v.get("fmt_offset"):
+            has_detail = True
+            break
+
+    if has_detail:
+        completed.append("offset_or_detail_known")
+        tier2_done += 1
+    else:
+        missing.append("offset_or_detail_known")
+
+    # Control primitive
+    has_primitive = analysis.get("control_hijack", False)
+    if not has_primitive:
+        for v in vulns:
+            if v.get("exploit_primitive") or v.get("type") in ("buffer_overflow", "format_string", "use_after_free"):
+                has_primitive = True
+                break
+
+    if has_primitive:
+        completed.append("control_primitive_identified")
+        tier2_done += 1
+    else:
+        missing.append("control_primitive_identified")
+
+    score += 0.25 * (tier2_done / tier2_items)
+
+    # --- Tier 3: ROP/Libc Requirements (+0.25) ---
+    tier3_items = 0
+    tier3_done = 0
+
+    # Gadgets needed if NX
+    if nx:
+        tier3_items += 1
+        if gadgets:
+            completed.append("rop_gadgets_found")
+            tier3_done += 1
+        else:
+            missing.append("rop_gadgets_found")
+
+    # Leak needed if NX and no win function
+    needs_leak = nx  # simplified: NX usually means need libc leak
+    if needs_leak:
+        tier3_items += 1
+        if analysis.get("leak_primitive"):
+            completed.append("leak_method_found")
+            tier3_done += 1
+        else:
+            missing.append("leak_method_found")
+
+        tier3_items += 1
+        if libc.get("detected"):
+            completed.append("libc_available")
+            tier3_done += 1
+        else:
+            missing.append("libc_available")
+
+    if tier3_items > 0:
+        score += 0.25 * (tier3_done / tier3_items)
+    elif checksec.get("done"):
+        # Checksec done and NX disabled → no ROP needed, full tier 3 score
+        score += 0.25
+        completed.append("no_rop_needed")
+    else:
+        # Checksec not done yet → can't determine tier 3, give 0
+        missing.append("tier3_unknown_until_checksec")
+
+    # --- Tier 4: Dynamic Verification (+0.15) ---
+    has_dynamic = False
+    if runs:
+        for run in runs:
+            cmds = run.get("commands", [])
+            cmd_str = " ".join(str(c) for c in cmds).lower()
+            if "pwndbg" in cmd_str or "gdb" in cmd_str:
+                has_dynamic = True
+                break
+
+    if has_dynamic:
+        completed.append("dynamic_verification_done")
+        score += 0.15
+    else:
+        missing.append("dynamic_verification_done")
+
+    # --- Tier 5: Strategy (+0.1) ---
+    if strategy:
+        completed.append("exploit_strategy_clear")
+        score += 0.1
+    else:
+        missing.append("exploit_strategy_clear")
+
+    return round(min(score, 1.0), 2), completed, missing
 

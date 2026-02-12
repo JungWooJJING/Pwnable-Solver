@@ -10,11 +10,15 @@ Responsibilities:
 import time
 import hashlib
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rich.console import Console
 from rich.panel import Panel
 
 from Agent.base import BaseAgent, parse_json_response
+from Templates.prompt import build_messages
+from LangGraph.state import mark_task_status, add_run, TaskRun
+from Tool.tool import Tool
 
 console = Console()
 
@@ -46,11 +50,9 @@ class InstructionAgent(BaseAgent):
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Run Instruction Agent."""
         console.print(Panel("Instruction Agent", style="bold cyan"))
-        
-        from Templates.prompt import build_messages
-        from LangGraph.state import mark_task_status, add_run, TaskRun
-        from Tool.tool import Tool
-        
+
+        self.clear_history()
+
         binary_path = state.get("binary_path", "")
         if not binary_path:
             console.print("[red]No binary path set[/red]")
@@ -83,34 +85,72 @@ class InstructionAgent(BaseAgent):
         # Parse response
         parsed = parse_json_response(response_text)
         
-        # Execute commands
+        # Execute commands (parallel for independent tools, sequential for state-mutating ones)
         executions = []
         commands = parsed.get("commands", [])
         seen_hashes = state.get("seen_cmd_hashes", [])
-        
+
+        # Separate state-mutating tools from parallelizable ones
+        STATE_MUTATING_TOOLS = {"Pwninit", "Run", "Pwndbg"}
+        parallel_cmds = []
+        sequential_cmds = []
+
         for cmd in commands:
             tool_name = cmd.get("tool", "")
             args = cmd.get("args", {})
-            task_id = cmd.get("task_id", "")
-            purpose = cmd.get("purpose", "")
-            
-            # Check for duplicate
             cmd_hash = compute_cmd_hash(tool_name, args)
             if cmd_hash in seen_hashes:
                 console.print(f"[yellow]Skipping duplicate: {tool_name}[/yellow]")
                 continue
-            
-            console.print(f"[green]Executing: {tool_name}({args})[/green]")
+            seen_hashes.append(cmd_hash)
 
-            # Execute tool
+            if tool_name in STATE_MUTATING_TOOLS:
+                sequential_cmds.append(cmd)
+            else:
+                parallel_cmds.append(cmd)
+
+        # Execute parallelizable tools concurrently
+        if parallel_cmds:
+            console.print(f"[cyan]Executing {len(parallel_cmds)} tools in parallel...[/cyan]")
+            with ThreadPoolExecutor(max_workers=min(len(parallel_cmds), 4)) as executor:
+                future_to_cmd = {}
+                for cmd in parallel_cmds:
+                    tool_name = cmd.get("tool", "")
+                    args = cmd.get("args", {})
+                    console.print(f"[green]  → {tool_name}({args})[/green]")
+                    future = executor.submit(self._execute_tool, tool, tool_name, args, state)
+                    future_to_cmd[future] = cmd
+
+                for future in as_completed(future_to_cmd):
+                    cmd = future_to_cmd[future]
+                    result = future.result()
+                    result["task_id"] = cmd.get("task_id", "")
+                    result["purpose"] = cmd.get("purpose", "")
+                    executions.append(result)
+
+                    stdout = result.get("stdout", "")
+                    stdout_preview = stdout[:500] + "..." if len(stdout) > 500 else stdout
+                    console.print(Panel(
+                        stdout_preview,
+                        title=f"{cmd.get('tool', '')} Output",
+                        border_style="green" if result.get("success") else "red"
+                    ))
+                    if cmd.get("task_id"):
+                        mark_task_status(state, cmd["task_id"], "in_progress")
+
+        # Execute state-mutating tools sequentially
+        for cmd in sequential_cmds:
+            tool_name = cmd.get("tool", "")
+            args = cmd.get("args", {})
+            task_id = cmd.get("task_id", "")
+            purpose = cmd.get("purpose", "")
+
+            console.print(f"[green]Executing: {tool_name}({args})[/green]")
             result = self._execute_tool(tool, tool_name, args, state)
             result["task_id"] = task_id
             result["purpose"] = purpose
-            
             executions.append(result)
-            seen_hashes.append(cmd_hash)
-            
-            # Show output preview
+
             stdout = result.get("stdout", "")
             stdout_preview = stdout[:500] + "..." if len(stdout) > 500 else stdout
             console.print(Panel(
@@ -118,8 +158,6 @@ class InstructionAgent(BaseAgent):
                 title=f"{tool_name} Output",
                 border_style="green" if result.get("success") else "red"
             ))
-            
-            # Update task status
             if task_id:
                 mark_task_status(state, task_id, "in_progress")
         

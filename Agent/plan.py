@@ -8,6 +8,14 @@ Responsibilities:
 - Update Analysis Document with findings
 """
 
+import sys
+from pathlib import Path
+
+# Ensure project root is in sys.path
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import time
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +23,8 @@ from rich.console import Console
 from rich.panel import Panel
 
 from Agent.base import BaseAgent, parse_json_response
+from Templates.prompt import build_messages
+from LangGraph.state import upsert_tasks, merge_analysis_updates
 
 console = Console()
 
@@ -38,11 +48,9 @@ class PlanAgent(BaseAgent):
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Run Plan Agent."""
         console.print(Panel("Plan Agent", style="bold magenta"))
-        
-        # Import here to avoid circular imports
-        from Templates.prompt import build_messages
-        from LangGraph.state import upsert_tasks
-        
+
+        self.clear_history()
+
         # Build messages
         messages = build_messages(
             agent="plan",
@@ -94,7 +102,6 @@ class PlanAgent(BaseAgent):
         
         # Process analysis updates
         if "analysis_updates" in parsed:
-            from LangGraph.state import merge_analysis_updates
             merge_analysis_updates(state, parsed["analysis_updates"])
 
         # Show reasoning

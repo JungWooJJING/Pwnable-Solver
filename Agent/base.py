@@ -175,42 +175,77 @@ class HistoryManager:
         self._maybe_truncate()
     
     def _maybe_truncate(self) -> None:
-        """Truncate history if it exceeds max_tokens."""
+        """Truncate history if it exceeds max_tokens, replacing removed messages with a summary."""
         if self.total_tokens() <= self.max_tokens:
             return
-        
+
         # Keep system message (index 0) and first user message (index 1)
         if len(self.messages) <= 2:
             return
-        
+
         system_msg = self.messages[0] if self.messages[0]["role"] == "system" else None
         first_user_idx = 1 if system_msg else 0
         first_user_msg = self.messages[first_user_idx] if first_user_idx < len(self.messages) else None
-        
+
         # Find how many messages to remove from middle
         target_tokens = int(self.max_tokens * 0.8)  # Leave 20% headroom
-        
+
         # Start from index after first user message
         start_idx = first_user_idx + 1 if first_user_msg else 1
-        
-        # Keep removing oldest middle messages until under limit
+
+        # Collect messages to remove
         truncated_messages = []
         while self.total_tokens() > target_tokens and len(self.messages) > start_idx + 2:
-            # Remove message after the protected initial messages
             removed = self.messages.pop(start_idx)
             truncated_messages.append(removed)
-        
+
         if truncated_messages:
             self.truncation_count += len(truncated_messages)
-            
-            # Insert truncation notice
+
+            # Build summary of truncated content instead of just deleting
+            summary = self._summarize_truncated(truncated_messages)
             notice = {
                 "role": "system",
-                "content": f"[History truncated: {len(truncated_messages)} messages removed to fit context window. Total truncations: {self.truncation_count}]"
+                "content": summary,
             }
             self.messages.insert(start_idx, notice)
-            
-            console.print(f"[yellow]History truncated: removed {len(truncated_messages)} messages[/yellow]")
+
+            console.print(f"[yellow]History summarized: {len(truncated_messages)} messages → summary[/yellow]")
+
+    def _summarize_truncated(self, messages: List[Dict[str, str]]) -> str:
+        """Extract key findings from truncated messages into a concise summary."""
+        key_items = []
+        for msg in messages:
+            content = msg.get("content", "")
+            # Extract lines containing important patterns
+            for line in content.split("\n"):
+                line_lower = line.lower().strip()
+                if any(kw in line_lower for kw in [
+                    "vulnerability", "offset", "gadget", "0x", "leaked",
+                    "buffer", "canary", "libc", "system", "free_hook",
+                    "malloc", "tcache", "found", "detected", "overflow",
+                    "format string", "use-after-free", "rip", "rsp",
+                ]):
+                    stripped = line.strip()
+                    if stripped and len(stripped) < 200:
+                        key_items.append(stripped)
+
+        # Deduplicate and limit
+        seen = set()
+        unique_items = []
+        for item in key_items:
+            if item not in seen:
+                seen.add(item)
+                unique_items.append(item)
+        unique_items = unique_items[:30]  # Max 30 key findings
+
+        summary = f"[History summarized: {len(messages)} messages compressed. Key findings preserved:]\n"
+        if unique_items:
+            summary += "\n".join(f"- {item}" for item in unique_items)
+        else:
+            summary += "(No key findings extracted from truncated messages)"
+
+        return summary
     
     def get_messages(self) -> List[Dict[str, str]]:
         """Get current message history."""
@@ -269,10 +304,6 @@ class OpenAIClient(LLMClient):
             "messages": messages,
             "temperature": temperature,
         }
-        
-        # Enable auto-truncation for supported models
-        if model.startswith("gpt-5") or model.startswith("gpt-4o"):
-            kwargs["truncation"] = "auto"
         
         if max_tokens:
             kwargs["max_tokens"] = max_tokens

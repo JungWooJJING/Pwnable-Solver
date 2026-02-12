@@ -11,6 +11,11 @@ import os
 import argparse
 from pathlib import Path
 
+# Ensure project root is in sys.path for package imports
+_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -130,9 +135,20 @@ def display_summary(state: SolverState) -> None:
 
     console.print(table)
 
+    # Staged Exploit progress
+    staged = state.get("staged_exploit", {})
+    stages = staged.get("stages", [])
+    if stages:
+        console.print("\n[bold cyan]Staged Exploit Progress:[/bold cyan]")
+        for s in stages:
+            status = "[green]✓[/green]" if s.get("verified") else "[red]✗[/red]"
+            refine_info = f" (refined {s.get('refinement_attempts', 0)}x)" if s.get("refinement_attempts", 0) > 0 else ""
+            console.print(f"  {status} Stage {s.get('stage_index', 0)+1}: {s.get('stage_id', '?')} — {s.get('description', '')}{refine_info}")
+
     # Exploit output
     exploit_output = state.get("exploit_output", {})
-    if exploit_output.get("json", {}).get("exploit_code"):
+    has_exploit = exploit_output.get("json", {}).get("exploit_code") or any(s.get("code") for s in stages)
+    if has_exploit:
         console.print("[bold green]✓ Exploit generated![/bold green]")
         binary_path = state.get("binary_path", "")
         if binary_path:
@@ -210,9 +226,17 @@ def ask_after_exploit(state: SolverState) -> str:
             style="green"
         ))
     elif verified:
+        # Show staged progress if available
+        staged = state.get("staged_exploit", {})
+        stages = staged.get("stages", [])
+        stage_info = ""
+        if stages:
+            verified_count = sum(1 for s in stages if s.get("verified"))
+            stage_info = f"\nStages: {verified_count}/{len(stages)} verified"
+
         console.print(Panel(
             f"[green]Exploit verified (shell access detected)[/green]\n"
-            f"Attempts: {attempts}",
+            f"Attempts: {attempts}{stage_info}",
             title="Exploit Success",
             style="green"
         ))
@@ -269,7 +293,7 @@ def run_solver(state: SolverState, ask_interval: int = 5) -> SolverState:
     while True:
         restart_workflow = False
 
-        for output in app.stream(state):
+        for output in app.stream(state, config={"recursion_limit": 9999}):
             if restart_workflow:
                 break
 
