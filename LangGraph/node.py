@@ -574,6 +574,23 @@ def Crash_analysis_node(
         console.print("[yellow]No core dump found. Analyzing exploit error...[/yellow]")
         gdb_analysis = f"No core dump available.\n\nExploit error output:\n{exploit_error}"
 
+        # Docker 모드: 컨테이너 로그 수집으로 보완
+        if state.get("docker_port"):
+            slug = Path(binary_path).stem.lower()
+            slug = re.sub(r"[^a-z0-9._-]+", "_", slug).strip("_") or "unknown"
+            container_name = f"pwn_{slug}_container"
+            try:
+                docker_result = subprocess.run(
+                    ["docker", "logs", "--tail", "50", container_name],
+                    capture_output=True, text=True, timeout=10,
+                )
+                docker_logs = (docker_result.stdout or "") + (docker_result.stderr or "")
+                if docker_logs.strip():
+                    gdb_analysis += f"\n\n--- Docker Container Logs ({container_name}) ---\n{docker_logs}"
+                    console.print(Panel(docker_logs[:1000], title="Docker Logs", border_style="yellow"))
+            except Exception:
+                pass
+
     crash_analysis["gdb_output"] = gdb_analysis
 
     # 3. 크래시 원인 분석 (패턴 매칭)
@@ -878,6 +895,10 @@ def Stage_verify_node(
     # Run the script
     try:
         env = os.environ.copy()
+        # Docker 모드: TARGET_HOST/TARGET_PORT 환경변수 주입
+        if state.get("docker_port"):
+            env["TARGET_HOST"] = "localhost"
+            env["TARGET_PORT"] = str(state.get("docker_port", 1337))
         result = subprocess.run(
             ["python3", exploit_path],
             capture_output=True,

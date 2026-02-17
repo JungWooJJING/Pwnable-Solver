@@ -212,6 +212,9 @@ class SolverState(TypedDict, total=False):
     # --- Staged Exploit (단계별 익스플로잇) ---
     staged_exploit: StagedExploitPlan
 
+    # --- Docker ---
+    docker_port: int                    # --docker 모드일 때 포트 (0이면 비활성)
+
 
 # =========================
 # State 초기화

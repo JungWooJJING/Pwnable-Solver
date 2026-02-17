@@ -455,9 +455,28 @@ class Tool:
         # Dockerfile 존재 확인
         dockerfile_path = workdir / "Dockerfile"
 
+        # 내부 포트 (Dockerfile에서 감지하거나 외부 port 사용)
+        internal_port = port
+
         if dockerfile_path.exists():
-            # 기존 Dockerfile 사용
+            # 기존 Dockerfile 사용 — 내부 포트 자동 감지
             console.print(f"[cyan]Using existing Dockerfile: {dockerfile_path}[/cyan]")
+            dockerfile_text = dockerfile_path.read_text(encoding="utf-8", errors="replace")
+
+            # EXPOSE 포트 파싱
+            expose_match = re.search(r"EXPOSE\s+(\d+)", dockerfile_text)
+            if expose_match:
+                internal_port = int(expose_match.group(1))
+                console.print(f"[cyan]Detected EXPOSE port: {internal_port}[/cyan]")
+
+            # ENV chall_port 또는 ENV port 파싱 (EXPOSE가 변수인 경우)
+            if not expose_match or "$" in (expose_match.group(0) if expose_match else ""):
+                env_port_match = re.search(
+                    r"ENV\s+(?:chall_port|port)\s+(\d+)", dockerfile_text, re.IGNORECASE
+                )
+                if env_port_match:
+                    internal_port = int(env_port_match.group(1))
+                    console.print(f"[cyan]Detected ENV port: {internal_port}[/cyan]")
         else:
             # 자동 Dockerfile 생성
             console.print(f"[cyan]Generating Dockerfile for Ubuntu {ubuntu_version}...[/cyan]")
@@ -502,11 +521,11 @@ CMD ["socat", "TCP-LISTEN:{port},reuseaddr,fork", "EXEC:/challenge/{binary_name}
             return f"Error: Docker build failed\n{error_msg}"
 
         # 컨테이너 실행
-        console.print(f"[cyan]Starting container on port {port}...[/cyan]")
+        console.print(f"[cyan]Starting container: host {port} → container {internal_port}...[/cyan]")
         run_cmd = [
             "docker", "run", "-d",
             "--name", container_name,
-            "-p", f"{port}:{port}",
+            "-p", f"{port}:{internal_port}",
             image_name
         ]
         stdout, stderr, rc = self._run_and_capture(run_cmd, timeout=30)

@@ -2032,19 +2032,30 @@ def solve():
 ## Exploit Code Guidelines
 - Use pwntools (`from pwn import *`)
 - **CRITICAL: Use ABSOLUTE paths for binary** - `context.binary = '{{ binary_path }}'`
-- **DEFAULT: Use process() for local testing** - pwninit has patched the binary!
 - Include logging (`log.info`, `log.success`)
 - Add comments explaining each step
+{% if docker_port %}
+- **Docker mode is ACTIVE (port {{ docker_port }}).** ALWAYS use `remote()`:
+  ```python
+  import os
+  host = os.environ.get('TARGET_HOST', 'localhost')
+  port = int(os.environ.get('TARGET_PORT', {{ docker_port }}))
+  p = remote(host, port)
+  ```
+  **NEVER use `p = process(...)` in Docker mode.**
+{% else %}
+- **DEFAULT: Use process() for local testing** - pwninit has patched the binary!
 - Connection pattern:
   ```python
   import os
-  if args.REMOTE or os.environ.get('TARGET_HOST'):
+  if os.environ.get('TARGET_HOST'):
       host = os.environ.get('TARGET_HOST', 'localhost')
       port = int(os.environ.get('TARGET_PORT', 1337))
       p = remote(host, port)
   else:
       p = process(context.binary.path)
   ```
+{% endif %}
 
 {{ tool_descriptions }}
 """)
@@ -2446,6 +2457,7 @@ def build_messages(
         "tool_descriptions": tool_desc,
         "challenge": state.get("challenge", {}),
         "binary_path": state.get("binary_path", ""),
+        "docker_port": state.get("docker_port", 0),
     }
     system_content = system_templates[agent_lower].render(**system_context)
 
@@ -2546,6 +2558,7 @@ def build_system_prompt(
     if state:
         context["challenge"] = state.get("challenge", {})
         context["binary_path"] = state.get("binary_path", "")
+        context["docker_port"] = state.get("docker_port", 0)
 
     return system_templates[agent.lower()].render(**context)
 
@@ -2695,6 +2708,24 @@ Your script MUST include equivalent logic before adding Stage {{ current_stage.s
 4. **EXACT I/O strings**: Use strings from the decompiled code, never guess.
 5. **Prefer one_gadget** over system for hook overwrites (simpler).
 6. **NEVER use p.interactive()**: Hangs the subprocess.
+
+## Connection Pattern (MANDATORY)
+{% if docker_port %}
+**Docker mode is ACTIVE (port {{ docker_port }}).** The binary may not run locally (e.g., missing flag files, special directories).
+**ALWAYS use `remote()` for connection:**
+```python
+import os
+host = os.environ.get('TARGET_HOST', 'localhost')
+port = int(os.environ.get('TARGET_PORT', {{ docker_port }}))
+p = remote(host, port)
+```
+**NEVER use `p = process(...)` in Docker mode.**
+{% else %}
+Use `process()` for local testing:
+```python
+p = process(context.binary.path)
+```
+{% endif %}
 
 ## I/O Interaction Rules (MANDATORY)
 
@@ -2850,6 +2881,17 @@ else:
     print(response.decode(errors='ignore'))
 p.close()
 ```
+
+{% if docker_port %}
+**Docker mode is ACTIVE.** The script MUST use `remote()`, not `process()`:
+```python
+import os
+host = os.environ.get('TARGET_HOST', 'localhost')
+port = int(os.environ.get('TARGET_PORT', {{ docker_port }}))
+p = remote(host, port)
+```
+If the failing script uses `process()`, change it to `remote()`.
+{% endif %}
 
 Focus on:
 - Incorrect I/O string matching (wrong menu strings)
@@ -3034,6 +3076,7 @@ def build_stage_exploit_messages(
         verified_stages=verified_stages,
         challenge=state.get("challenge", {}),
         binary_path=state.get("binary_path", ""),
+        docker_port=state.get("docker_port", 0),
     )
 
     # Generate I/O helper code from decompiled binary
