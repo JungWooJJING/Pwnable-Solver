@@ -104,10 +104,14 @@ class FeedbackAgent(BaseAgent):
         llm_recommend = parsed.get("recommend_exploit", False)
         llm_loop = parsed.get("loop_continue", True)
 
+        # #4: 취약점 타입별 동적 threshold
+        effective_threshold = self._compute_dynamic_threshold(analysis)
+        console.print(f"[cyan]Dynamic Threshold: {effective_threshold:.2f} (base: {self.readiness_threshold})[/cyan]")
+
         # Recommend exploit if code score meets threshold
-        recommend_exploit = readiness_score >= self.readiness_threshold
+        recommend_exploit = readiness_score >= effective_threshold
         # Also allow if LLM recommends and score is close
-        if llm_recommend and readiness_score >= (self.readiness_threshold - 0.15):
+        if llm_recommend and readiness_score >= (effective_threshold - 0.15):
             recommend_exploit = True
 
         state["exploit_readiness"] = {
@@ -140,14 +144,64 @@ class FeedbackAgent(BaseAgent):
             state["loop"] = False
         else:
             # Always continue until max iterations or exploit ready
+            feedback_additions = []
+
             if missing:
                 console.print(f"[yellow]  Still missing: {', '.join(missing)} — continuing[/yellow]")
+                feedback_additions.append(f"[AUTO] Focus on resolving missing items: {', '.join(missing)}")
+
+            # #3: 실패한 익스 정보를 Plan에 피드백
+            failure_ctx = state.get("exploit_failure_context", {})
+            if failure_ctx:
+                stage_id = failure_ctx.get("stage_id", "unknown")
+                error = failure_ctx.get("error", "")[:300]
+                code_snippet = failure_ctx.get("code", "")[:500]
+                feedback_additions.append(
+                    f"\n[EXPLOIT FAILURE] Stage '{stage_id}' failed after {failure_ctx.get('attempts', '?')} attempts.\n"
+                    f"Error: {error}\n"
+                    f"Failing code snippet:\n```python\n{code_snippet}\n```\n"
+                    f"→ Re-analyze: check offsets, I/O interaction pattern, leak values. "
+                    f"If leak returns 0x0, the leak offset is wrong."
+                )
+
+            if feedback_additions:
                 if "feedback_to_plan" not in parsed or not parsed["feedback_to_plan"]:
                     parsed["feedback_to_plan"] = ""
-                parsed["feedback_to_plan"] += (
-                    f"\n\n[AUTO] Focus on resolving missing items: {', '.join(missing)}"
-                )
+                parsed["feedback_to_plan"] += "\n\n" + "\n\n".join(feedback_additions)
                 state["feedback_output"]["json"] = parsed
+
             state["loop"] = True
 
         return state
+
+    def _compute_dynamic_threshold(self, analysis: dict) -> float:
+        """#4: 취약점 타입에 따라 readiness threshold를 동적으로 계산."""
+        vulns = analysis.get("vulnerabilities", [])
+        has_win = analysis.get("win_function", False)
+        checksec = analysis.get("checksec", {})
+        result_str = str(checksec.get("result", "")).lower()
+        nx = "nx enabled" in result_str
+        pie = "pie enabled" in result_str and "no pie" not in result_str
+
+        vuln_types = {v.get("type", "") for v in vulns}
+
+        # win 함수 있으면 매우 낮은 임계값 (leak만 있으면 됨)
+        if has_win and not pie:
+            return 0.35
+        if has_win and pie:
+            return 0.40
+
+        # fmt string: GOT overwrite 가능하면 libc leak 없어도 됨
+        if "format_string" in vuln_types:
+            return 0.40
+
+        # shellcode (NX disabled): ROP/libc 불필요
+        if not nx:
+            return 0.35
+
+        # heap: 분석이 복잡하므로 조금 더 요구
+        if any(t in vuln_types for t in ("use_after_free", "heap_overflow", "double_free")):
+            return 0.55
+
+        # 기본 BOF+ROP 시나리오
+        return self.readiness_threshold

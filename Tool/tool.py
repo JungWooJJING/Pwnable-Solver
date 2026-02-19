@@ -455,8 +455,9 @@ class Tool:
         # Dockerfile 존재 확인
         dockerfile_path = workdir / "Dockerfile"
 
-        # 내부 포트 (Dockerfile에서 감지하거나 외부 port 사용)
+        # 내부 포트 및 WORKDIR (Dockerfile에서 감지)
         internal_port = port
+        container_workdir = "/challenge"  # 자동 생성 Dockerfile 기본값
 
         if dockerfile_path.exists():
             # 기존 Dockerfile 사용 — 내부 포트 자동 감지
@@ -477,6 +478,12 @@ class Tool:
                 if env_port_match:
                     internal_port = int(env_port_match.group(1))
                     console.print(f"[cyan]Detected ENV port: {internal_port}[/cyan]")
+
+            # WORKDIR 파싱 (core dump 볼륨 마운트용)
+            workdir_match = re.search(r"WORKDIR\s+(\S+)", dockerfile_text)
+            if workdir_match:
+                container_workdir = workdir_match.group(1).strip()
+                console.print(f"[cyan]Detected WORKDIR: {container_workdir}[/cyan]")
         else:
             # 자동 Dockerfile 생성
             console.print(f"[cyan]Generating Dockerfile for Ubuntu {ubuntu_version}...[/cyan]")
@@ -520,12 +527,14 @@ CMD ["socat", "TCP-LISTEN:{port},reuseaddr,fork", "EXEC:/challenge/{binary_name}
             error_msg = stderr if stderr else stdout
             return f"Error: Docker build failed\n{error_msg}"
 
-        # 컨테이너 실행
+        # 컨테이너 실행 (core dump 활성화 + 볼륨 마운트로 호스트에서 core 접근)
         console.print(f"[cyan]Starting container: host {port} → container {internal_port}...[/cyan]")
         run_cmd = [
             "docker", "run", "-d",
             "--name", container_name,
             "-p", f"{port}:{internal_port}",
+            "--ulimit", "core=-1",  # core dump 활성화
+            "-v", f"{workdir}:{container_workdir}",  # core 파일을 호스트 workdir에 생성
             image_name
         ]
         stdout, stderr, rc = self._run_and_capture(run_cmd, timeout=30)

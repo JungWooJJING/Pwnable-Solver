@@ -268,6 +268,97 @@ def _run_phase1_recon(state: State, binary_path: str) -> None:
     except Exception as e:
         console.print(f"[yellow]Ghidra failed: {e}[/yellow]")
 
+    # --- Symbol Scan: win function + all function addresses ---
+    try:
+        import subprocess as _sp
+        import re as _re
+
+        # Try nm first (works on non-stripped), fallback to readelf -s
+        sym_result = _sp.run(
+            ["nm", "--defined-only", binary_path],
+            capture_output=True, text=True, timeout=10
+        )
+        if sym_result.returncode != 0 or not sym_result.stdout.strip():
+            sym_result = _sp.run(
+                ["readelf", "-s", binary_path],
+                capture_output=True, text=True, timeout=10
+            )
+
+        sym_raw = sym_result.stdout
+        sym_lower = sym_raw.lower()
+
+        # Parse function symbols: "addr T funcname" or readelf format
+        # nm format:  0000000000401156 T win
+        # readelf format: ... FUNC ... win
+        func_map: dict = {}
+        for line in sym_raw.splitlines():
+            # nm format
+            nm_match = _re.match(r'([0-9a-fA-F]+)\s+[Tt]\s+(\S+)', line)
+            if nm_match:
+                addr_hex, fname = nm_match.group(1), nm_match.group(2)
+                func_map[fname.lower()] = int(addr_hex, 16)
+                continue
+            # readelf format: "  Num: addr size FUNC ... name"
+            re_match = _re.search(r':\s+([0-9a-fA-F]+)\s+\d+\s+FUNC\s+\S+\s+\S+\s+\S+\s+(\S+)', line)
+            if re_match:
+                addr_hex, fname = re_match.group(1), re_match.group(2)
+                if int(addr_hex, 16) > 0:
+                    func_map[fname.lower()] = int(addr_hex, 16)
+
+        WIN_KEYWORDS = ["win", "flag", "shell", "backdoor", "get_shell", "spawn_shell"]
+        found_win = any(kw in sym_lower for kw in WIN_KEYWORDS)
+
+        if found_win:
+            # Find the first matching win function name and its address
+            matched_names = [kw for kw in WIN_KEYWORDS if kw in sym_lower]
+            win_addr = 0
+            win_name = ""
+            for kw in WIN_KEYWORDS:
+                for fname, addr in func_map.items():
+                    if kw in fname:
+                        win_addr = addr
+                        win_name = fname
+                        break
+                if win_addr:
+                    break
+
+            win_addr_str = f"0x{win_addr:x}" if win_addr else "(address unknown)"
+            console.print(f"[bold green]Win function detected: {matched_names} → {win_name} @ {win_addr_str}[/bold green]")
+
+            # Store win function address via merge so all fields are consistent
+            merge_analysis_updates(state, {
+                "win_function": True,
+                "win_function_name": win_name,
+                "win_function_addr": win_addr_str,
+            })
+
+            # Re-run KB strategy with win_function=True so the right strategy is set
+            try:
+                from Store.knowledge import get_checksec_guide
+                checksec_data = state.get("analysis", {}).get("checksec", {})
+                guide = get_checksec_guide(checksec_data, win_function=True)
+                if guide.get("recommended"):
+                    top = guide["recommended"][0]
+                    strategy = f"Recommended: {top.get('name', '')} ({top.get('description', '')})"
+                    merge_analysis_updates(state, {"strategy": strategy})
+                    console.print(f"[bold green]KB Strategy updated (win function): {strategy}[/bold green]")
+            except Exception:
+                pass
+        else:
+            console.print("[cyan]No win function found in symbols[/cyan]")
+
+        # Log all found functions for Plan agent context
+        if func_map:
+            fn_summary = ", ".join(f"{n}@0x{a:x}" for n, a in list(func_map.items())[:20])
+            console.print(f"[dim]Functions found: {fn_summary}[/dim]")
+            # Store function list as a known fact
+            facts = state.get("facts", {})
+            facts["function_symbols"] = {n: f"0x{a:x}" for n, a in func_map.items()}
+            state["facts"] = facts
+
+    except Exception as e:
+        console.print(f"[yellow]Symbol scan failed: {e}[/yellow]")
+
     console.print("[green]Phase 1 RECON complete - Plan Agent starts at Phase 2[/green]")
 
 
@@ -913,6 +1004,48 @@ def Stage_verify_node(
     except subprocess.TimeoutExpired:
         combined = "TIMEOUT: Exploit timed out after 60 seconds"
         console.print(f"[red]{combined}[/red]")
+
+        # Probe the binary to capture its actual I/O output so the refiner can
+        # identify wrong recvuntil() strings (the most common cause of timeout).
+        binary_path = state.get("binary_path", "")
+        if binary_path and Path(binary_path).exists():
+            try:
+                import pty, os as _os, select as _sel, time as _t
+                # Run binary briefly, send a newline, capture first ~500 bytes of output
+                master_fd, slave_fd = pty.openpty()
+                probe_proc = subprocess.Popen(
+                    [binary_path],
+                    stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                    close_fds=True,
+                )
+                _os.close(slave_fd)
+                _t.sleep(0.3)
+                probe_output = b""
+                while True:
+                    r, _, _ = _sel.select([master_fd], [], [], 0.2)
+                    if not r:
+                        break
+                    chunk = _os.read(master_fd, 256)
+                    if not chunk:
+                        break
+                    probe_output += chunk
+                    if len(probe_output) >= 512:
+                        break
+                probe_proc.kill()
+                probe_proc.wait(timeout=2)
+                _os.close(master_fd)
+                if probe_output:
+                    combined += (
+                        f"\n\n[BINARY PROBE] Actual binary output (first interaction):\n"
+                        f"{repr(probe_output)}\n\n"
+                        "HINT: recvuntil() strings in the exploit MUST EXACTLY match the above output.\n"
+                        "Common cause of timeout: waiting for a string that does not appear "
+                        "(e.g. 'Result: ' when the binary only outputs the buffer directly)."
+                    )
+                    console.print(f"[yellow]Binary probe output: {repr(probe_output[:200])}[/yellow]")
+            except Exception as probe_err:
+                console.print(f"[dim]Binary probe failed: {probe_err}[/dim]")
+
         current_stage["verified"] = False
         current_stage["error"] = combined
         stages[current_idx] = current_stage
@@ -984,30 +1117,60 @@ def Stage_verify_node(
             current_stage["verified"] = False
             current_stage["error"] = combined
         elif has_marker:
-            # Additional heuristic: for leak stages, check if a valid address is near the marker
-            is_leak_stage = current_stage.get("stage_id", "").lower() in ("leak", "canary_leak")
+            # Additional heuristic: for leak stages, check if leaked values are valid
+            stage_id_lower = current_stage.get("stage_id", "").lower()
+            is_leak_stage = "leak" in stage_id_lower or "canary" in stage_id_lower
+
             if is_leak_stage:
-                # Extract the marker line and nearby context
+                # Extract the marker line
                 marker_line = ""
                 for line in combined.split("\n"):
                     if marker in line:
                         marker_line = line
                         break
-                # Check if marker line contains a hex value that looks valid (not 0x0 or very small)
-                addr_match = re.search(r"0x([0-9a-fA-F]+)", marker_line)
-                if addr_match:
-                    addr_val = int(addr_match.group(1), 16)
-                    if addr_val < 0x1000:
-                        console.print(f"[red]Stage {current_idx+1} FAILED (leaked value 0x{addr_val:x} is too small — likely invalid)[/red]")
-                        current_stage["verified"] = False
-                        current_stage["error"] = f"Leaked value 0x{addr_val:x} is invalid (too small)\n" + combined
+
+                # For canary_pie_leak: validate pie_leak specifically (canary is always non-zero)
+                if "canary_pie" in stage_id_lower or "pie" in stage_id_lower:
+                    pie_match = re.search(r"pie_leak=0x([0-9a-fA-F]+)", marker_line)
+                    if pie_match:
+                        pie_val = int(pie_match.group(1), 16)
+                        if pie_val < 0x1000:
+                            console.print(f"[red]Stage {current_idx+1} FAILED (pie_leak=0x{pie_val:x} is invalid — likely wrong offset)[/red]")
+                            current_stage["verified"] = False
+                            current_stage["error"] = f"pie_leak=0x{pie_val:x} is invalid (too small — check leak offset)\n" + combined
+                        else:
+                            console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, pie_leak=0x{pie_val:x})[/bold green]")
+                            current_stage["verified"] = True
                     else:
-                        console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, addr=0x{addr_val:x})[/bold green]")
-                        current_stage["verified"] = True
+                        # No pie_leak= field — fall back to any hex value check
+                        addr_match = re.search(r"0x([0-9a-fA-F]+)", marker_line)
+                        if addr_match:
+                            addr_val = int(addr_match.group(1), 16)
+                            if addr_val < 0x1000:
+                                console.print(f"[red]Stage {current_idx+1} FAILED (leaked value 0x{addr_val:x} is too small)[/red]")
+                                current_stage["verified"] = False
+                                current_stage["error"] = f"Leaked value 0x{addr_val:x} is invalid (too small)\n" + combined
+                            else:
+                                console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, addr=0x{addr_val:x})[/bold green]")
+                                current_stage["verified"] = True
+                        else:
+                            console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found)[/bold green]")
+                            current_stage["verified"] = True
                 else:
-                    # Marker found but no hex value — still accept but warn
-                    console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found)[/bold green]")
-                    current_stage["verified"] = True
+                    # Generic leak stage: check first hex value
+                    addr_match = re.search(r"0x([0-9a-fA-F]+)", marker_line)
+                    if addr_match:
+                        addr_val = int(addr_match.group(1), 16)
+                        if addr_val < 0x1000:
+                            console.print(f"[red]Stage {current_idx+1} FAILED (leaked value 0x{addr_val:x} is too small — likely invalid)[/red]")
+                            current_stage["verified"] = False
+                            current_stage["error"] = f"Leaked value 0x{addr_val:x} is invalid (too small)\n" + combined
+                        else:
+                            console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, addr=0x{addr_val:x})[/bold green]")
+                            current_stage["verified"] = True
+                    else:
+                        console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found)[/bold green]")
+                        current_stage["verified"] = True
             else:
                 console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found)[/bold green]")
                 current_stage["verified"] = True

@@ -154,6 +154,19 @@ def route_after_stage_verify(
             return "stage_refine"
         else:
             console.print(f"[red]Stage {current_idx+1} exhausted retries → re-analyzing[/red]")
+            # 실패 컨텍스트를 state에 기록해서 Plan이 인지하도록
+            state["analysis_failure_reason"] = (
+                f"Stage '{current_stage.get('stage_id', '?')}' failed after {max_attempts} refinement attempts. "
+                f"Description: {current_stage.get('description', '')}. "
+                f"Error: {current_stage.get('error', '')[:500]}"
+            )
+            state["exploit_failure_context"] = {
+                "stage_id": current_stage.get("stage_id", ""),
+                "stage_index": current_idx,
+                "code": current_stage.get("code", "")[:2000],
+                "error": current_stage.get("error", "")[:1000],
+                "attempts": max_attempts,
+            }
             return "plan"
 
 

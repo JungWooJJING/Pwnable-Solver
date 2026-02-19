@@ -121,12 +121,21 @@ class AnalysisDisasm(TypedDict, total=False):
     result: str
 
 
+class AnalysisIOPattern(TypedDict, total=False):
+    prompt: str            # exact string binary outputs before input (e.g. "Pattern: ", "Size: ")
+    input_method: str      # "scanf", "read", "gets", "fgets", "recv", etc.
+    format: str            # format string if scanf ("%d", "%s", etc.)
+    max_len: int           # max input length if known
+
+
 class AnalysisVuln(TypedDict, total=False):
     type: str                      # buffer_overflow, format_string, use_after_free, etc.
     function: str
     location: str
     description: str
     code_snippet: str
+    exploit_constraints: List[str] # binary-specific constraints (e.g. ["target_len <= 1000", "pattern len <= 80"])
+    exploit_mechanism: str         # how overflow actually works (e.g. "standard linear overflow" or "pattern repeat overshoot")
 
 
 class AnalysisLibc(TypedDict, total=False):
@@ -142,6 +151,27 @@ class AnalysisGadget(TypedDict, total=False):
     address: str
 
 
+class AnalysisDynamicVerification(TypedDict, total=False):
+    """
+    Runtime values extracted by the LLM from Pwndbg/GDB output.
+    Populated by the Parsing Agent after a Pwndbg task is run.
+    """
+    verified: bool
+    # Stack layout (all values are LLM-extracted from GDB output)
+    buf_offset_to_canary: int        # bytes from buf[0] to canary (e.g. 984)
+    buf_offset_to_saved_rbp: int     # bytes from buf[0] to saved rbp  (e.g. 1000)
+    buf_offset_to_ret: int           # bytes from buf[0] to return addr (e.g. 1008)
+    canary_offset_from_rbp: int      # negative offset, e.g. -16
+    # Local variables (LLM fills from 'info locals' / 'info frame' output)
+    local_vars: List[Dict[str, Any]] # [{name, address, size, offset_from_rbp}, ...]
+    # Memory layout
+    binary_base: str                 # hex, from vmmap (e.g. "0x555555554000")
+    stack_base: str                  # hex, approximate rsp at time of capture
+    rbp_value: str                   # hex (e.g. "0x7fffffffe0f0")
+    # Raw output for reference
+    raw_gdb_output: str
+
+
 class Analysis(TypedDict, total=False):
     """Progressive Analysis Document - filled incrementally"""
     checksec: AnalysisChecksec
@@ -151,10 +181,17 @@ class Analysis(TypedDict, total=False):
     strategy: str                  # Exploitation strategy description
     libc: AnalysisLibc
     gadgets: List[AnalysisGadget]
+    io_patterns: List[AnalysisIOPattern]  # Binary I/O prompts/inputs extracted from decompiled code
+    win_function: bool             # win/flag/backdoor function exists in binary
+    win_function_name: str         # name of the win function (e.g. "win", "get_flag")
+    win_function_addr: str         # address of the win function (e.g. "0x401156")
+    heap_pointer_type: str         # "single", "array", "linked_list", "unknown"
+    dynamic_verification: AnalysisDynamicVerification  # LLM-extracted runtime values from Pwndbg
     leak_primitive: bool
     control_hijack: bool
     payload_ready: bool
     readiness_score: float         # 0.0 ~ 1.0
+    last_exploit_failure: Dict[str, Any]  # Set by crash analysis node
 
 
 class SolverState(TypedDict, total=False):
@@ -212,6 +249,10 @@ class SolverState(TypedDict, total=False):
     # --- Staged Exploit (단계별 익스플로잇) ---
     staged_exploit: StagedExploitPlan
 
+    # --- 실패 컨텍스트 (Plan 재진입 시 사용) ---
+    analysis_failure_reason: str        # "stage_failed", "exploit_failed" 등
+    exploit_failure_context: Dict[str, Any]  # {stage_id, code, error, attempts}
+
     # --- Docker ---
     docker_port: int                    # --docker 모드일 때 포트 (0이면 비활성)
 
@@ -236,10 +277,17 @@ def init_analysis() -> Analysis:
             "offsets": {}
         },
         "gadgets": [],
+        "io_patterns": [],
+        "win_function": False,
+        "win_function_name": "",
+        "win_function_addr": "",
+        "heap_pointer_type": "unknown",
+        "dynamic_verification": {"verified": False, "local_vars": [], "raw_gdb_output": ""},
         "leak_primitive": False,
         "control_hijack": False,
         "payload_ready": False,
-        "readiness_score": 0.0
+        "readiness_score": 0.0,
+        "last_exploit_failure": {},
     }
 
 
@@ -299,6 +347,10 @@ def init_state(**overrides: Any) -> SolverState:
             "current_stage_index": 0,
             "all_stages_verified": False,
         },
+
+        # 실패 컨텍스트
+        "analysis_failure_reason": "",
+        "exploit_failure_context": {},
     }
     state.update(overrides)
     return state
@@ -325,6 +377,8 @@ def get_state_for_plan(state: SolverState) -> Dict[str, Any]:
         "tasks": _summarize_tasks(state.get("tasks", []), limit=20),
         "runs": state.get("runs", [])[-5:],  # 최근 5개만
         "exploit_readiness": state.get("exploit_readiness", {}),
+        "analysis_failure_reason": state.get("analysis_failure_reason", ""),
+        "exploit_failure_context": state.get("exploit_failure_context", {}),
     }
 
 
@@ -581,7 +635,10 @@ def merge_analysis_updates(state: SolverState, updates: Dict[str, Any]) -> None:
 
     # Libc
     if "libc" in updates:
-        analysis["libc"].update(updates["libc"])
+        if isinstance(updates["libc"], dict):
+            analysis["libc"].update(updates["libc"])
+        else:
+            analysis["libc"]["version"] = str(updates["libc"])
 
     # Gadgets (append)
     if "gadgets" in updates:
@@ -591,10 +648,36 @@ def merge_analysis_updates(state: SolverState, updates: Dict[str, Any]) -> None:
             if gadget.get("address") not in existing_addrs:
                 analysis["gadgets"].append(gadget)
 
+    # Heap pointer type
+    if "heap_pointer_type" in updates:
+        analysis["heap_pointer_type"] = str(updates["heap_pointer_type"])
+
+    # I/O patterns (append new ones, deduplicate by prompt string)
+    if "io_patterns" in updates:
+        existing_prompts = {p.get("prompt", "") for p in analysis.get("io_patterns", [])}
+        for pattern in updates["io_patterns"]:
+            if pattern.get("prompt", "") not in existing_prompts:
+                analysis.setdefault("io_patterns", []).append(pattern)
+                existing_prompts.add(pattern.get("prompt", ""))
+
     # Boolean flags
-    for flag in ["leak_primitive", "control_hijack", "payload_ready"]:
+    for flag in ["win_function", "leak_primitive", "control_hijack", "payload_ready"]:
         if flag in updates:
             analysis[flag] = updates[flag]
+
+    # Win function metadata
+    for field in ["win_function_name", "win_function_addr"]:
+        if field in updates:
+            analysis[field] = str(updates[field])
+
+    # Dynamic verification (LLM-extracted from Pwndbg output — deep merge)
+    if "dynamic_verification" in updates:
+        dv = analysis.setdefault("dynamic_verification", {"verified": False, "local_vars": [], "raw_gdb_output": ""})
+        dv.update(updates["dynamic_verification"])
+
+    # Last exploit failure (overwrite)
+    if "last_exploit_failure" in updates:
+        analysis["last_exploit_failure"] = updates["last_exploit_failure"]
 
     state["analysis"] = analysis
 
@@ -636,6 +719,10 @@ def compute_readiness(analysis: Analysis, runs: Optional[List] = None) -> Tuple[
     has_canary = False
     if "canary found" in result_str and "no canary" not in result_str:
         has_canary = True
+
+    pie = checksec.get("pie", False)
+    if "pie enabled" in result_str and "no pie" not in result_str:
+        pie = True
 
     # --- Tier 1: Basic Requirements (+0.25) ---
     tier1_items = 3
@@ -701,45 +788,64 @@ def compute_readiness(analysis: Analysis, runs: Optional[List] = None) -> Tuple[
     tier3_items = 0
     tier3_done = 0
 
-    # Gadgets needed if NX
-    if nx:
-        tier3_items += 1
-        if gadgets:
-            completed.append("rop_gadgets_found")
-            tier3_done += 1
-        else:
-            missing.append("rop_gadgets_found")
+    has_win = analysis.get("win_function", False)
 
-    # Leak needed if NX and no win function
-    needs_leak = nx  # simplified: NX usually means need libc leak
-    if needs_leak:
-        tier3_items += 1
-        if analysis.get("leak_primitive"):
-            completed.append("leak_method_found")
-            tier3_done += 1
-        else:
-            missing.append("leak_method_found")
-
-        tier3_items += 1
-        if libc.get("detected"):
-            completed.append("libc_available")
-            tier3_done += 1
-        else:
-            missing.append("libc_available")
-
-    if tier3_items > 0:
-        score += 0.25 * (tier3_done / tier3_items)
-    elif checksec.get("done"):
-        # Checksec done and NX disabled → no ROP needed, full tier 3 score
+    if has_win and not pie:
+        # Simple ret2win (no PIE): fixed address → no leak, no gadgets, no libc needed
         score += 0.25
-        completed.append("no_rop_needed")
+        completed.append("win_function_no_pie")
+    elif has_win and pie:
+        # ret2win with PIE: need binary base leak, but NOT libc or gadgets
+        tier3_items = 1
+        if analysis.get("leak_primitive"):
+            completed.append("pie_base_leak_found")
+            tier3_done += 1
+        else:
+            missing.append("pie_base_leak_for_win")
+        score += 0.25 * (tier3_done / tier3_items)
     else:
-        # Checksec not done yet → can't determine tier 3, give 0
-        missing.append("tier3_unknown_until_checksec")
+        # Standard path: no win function
+        # Gadgets needed if NX
+        if nx:
+            tier3_items += 1
+            if gadgets:
+                completed.append("rop_gadgets_found")
+                tier3_done += 1
+            else:
+                missing.append("rop_gadgets_found")
+
+        # Leak + libc needed if NX
+        if nx:
+            tier3_items += 1
+            if analysis.get("leak_primitive"):
+                completed.append("leak_method_found")
+                tier3_done += 1
+            else:
+                missing.append("leak_method_found")
+
+            tier3_items += 1
+            if libc.get("detected"):
+                completed.append("libc_available")
+                tier3_done += 1
+            else:
+                missing.append("libc_available")
+
+        if tier3_items > 0:
+            score += 0.25 * (tier3_done / tier3_items)
+        elif checksec.get("done"):
+            # Checksec done and NX disabled → shellcode, no ROP needed
+            score += 0.25
+            completed.append("no_rop_needed")
+        else:
+            # Checksec not done yet → can't determine tier 3
+            missing.append("tier3_unknown_until_checksec")
 
     # --- Tier 4: Dynamic Verification (+0.15) ---
-    has_dynamic = False
-    if runs:
+    # Primary check: LLM has extracted and stored verified runtime values
+    dv = analysis.get("dynamic_verification", {})
+    has_dynamic = bool(dv.get("verified"))
+    # Fallback: any Pwndbg/GDB run recorded (partial credit)
+    if not has_dynamic and runs:
         for run in runs:
             cmds = run.get("commands", [])
             cmd_str = " ".join(str(c) for c in cmds).lower()

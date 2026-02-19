@@ -300,7 +300,9 @@ void vuln(void) {
 ### Common Win Functions to Look For
 - `win`, `flag`, `shell`, `system`, `backdoor`
 - Functions that call `system("/bin/sh")` or read flag file
-- If found: Simple ret2win (overflow → jump to win)
+- If found: **ALWAYS set `win_function: true` in analysis_updates**
+  - No PIE: jump directly to fixed address → no leak needed
+  - PIE enabled: need binary base leak first, then jump to `pie_base + win_offset`
 
 ---
 
@@ -324,17 +326,21 @@ void vuln(void) {
         "buffer_size": 64,
         "estimated_offset": 72,
         "description": "64-byte buffer with gets() - no bounds checking",
-        "code_snippet": "char local_48[64]; gets(local_48);"
+        "code_snippet": "char local_48[64]; gets(local_48);",
+        "exploit_constraints": ["no input size limit"],
+        "exploit_mechanism": "standard linear overflow: payload = padding + canary + rbp + ret_addr"
       }
     ],
     "offsets": {
       "buffer_to_rbp": 64,
       "buffer_to_rip": 72,
       "verified": false
-    }
+    },
+    "win_function": true
   }
 }
 ```
+*(Set `win_function: true` only when a win/flag/backdoor function is confirmed)*
 """
 
 PWNINIT_GUIDANCE = """## Pwninit - Libc Patching Setup
@@ -815,6 +821,15 @@ ANALYSIS_DOCUMENT_TEMPLATE = env.from_string("""## Binary Information
 #### {{ vuln.type | default("unknown") }} in `{{ vuln.function | default("unknown") }}`
 - **Location:** {{ vuln.location | default("N/A") }}
 - **Description:** {{ vuln.description | default("N/A") }}
+{% if vuln.exploit_mechanism is defined and vuln.exploit_mechanism %}
+- **⚠️ Exploit Mechanism:** {{ vuln.exploit_mechanism }}
+{% endif %}
+{% if vuln.exploit_constraints is defined and vuln.exploit_constraints %}
+- **⚠️ Constraints:**
+{% for c in vuln.exploit_constraints %}
+  - `{{ c }}`
+{% endfor %}
+{% endif %}
 {% if vuln.code_snippet is defined and vuln.code_snippet %}
 ```c
 {{ vuln.code_snippet }}
@@ -906,6 +921,80 @@ ANALYSIS_DOCUMENT_TEMPLATE = env.from_string("""## Binary Information
 
 ---
 
+## Dynamic Verification (Pwndbg/GDB)
+
+{% set dv = analysis.dynamic_verification if analysis.dynamic_verification is defined else {} %}
+{% if dv.verified %}
+✅ **Verified** — runtime values extracted by LLM from GDB output.
+
+### Stack Offsets (from buf[0])
+| Field | Value |
+|-------|-------|
+| buf[0] → canary | `{{ dv.buf_offset_to_canary }}` bytes |
+| buf[0] → saved RBP | `{{ dv.buf_offset_to_saved_rbp }}` bytes |
+| buf[0] → return addr | `{{ dv.buf_offset_to_ret }}` bytes |
+| canary offset from RBP | `{{ dv.canary_offset_from_rbp }}` |
+
+{% if dv.binary_base %}
+### Memory Layout
+- Binary base: `{{ dv.binary_base }}`
+- RBP at capture: `{{ dv.rbp_value | default("?") }}`
+{% endif %}
+
+{% if dv.local_vars %}
+### Local Variables
+| Name | Address | Size | Offset from RBP |
+|------|---------|------|----------------|
+{% for v in dv.local_vars %}
+| `{{ v.name }}` | `{{ v.address }}` | {{ v.size }} | {{ v.offset_from_rbp }} |
+{% endfor %}
+{% endif %}
+
+{% if dv.raw_gdb_output %}
+### Raw GDB Output (excerpt)
+```
+{{ dv.raw_gdb_output[:800] }}
+```
+{% endif %}
+{% else %}
+⚠️ **NOT YET DONE** — dynamic verification is REQUIRED before exploit generation.
+
+**ACTION REQUIRED:** Run `Pwndbg` with stack inspection commands, then have the Parsing Agent
+extract and populate the `dynamic_verification` fields in this document.
+
+Suggested commands:
+```
+break read
+run < /dev/zero
+up
+info frame
+info locals
+x/8gx $rbp-0x30
+x/2gx $rbp
+p/x $rbp
+```
+{% endif %}
+
+---
+
+## Binary Function Symbols
+
+{% if function_symbols %}
+| Function | Address |
+|----------|---------|
+{% for fname, addr in function_symbols.items() %}
+| `{{ fname }}` | `{{ addr }}` |
+{% endfor %}
+{% if analysis.win_function is defined and analysis.win_function %}
+⚠️ **Win/backdoor function detected** (`{{ analysis.win_function_name | default("see above") }}` @ `{{ analysis.win_function_addr | default("?") }}`).
+Use this function as the exploit target — **no libc leak needed**.
+{% endif %}
+{% else %}
+[NOT YET — will be populated by Phase 1 RECON]
+{% endif %}
+
+---
+
 ## Exploit Readiness
 
 | Component | Status |
@@ -960,9 +1049,40 @@ PLAN_SYSTEM = env.from_string("""You are the **Plan Agent** for a pwnable CTF so
     }
   ],
   "analysis_updates": {},
-  "next_focus": "What to prioritize next"
+  "next_focus": "What to prioritize next",
+  "blockers": [
+    {"question": "Is the leak offset correct?", "severity": 0.9, "resolved": false}
+  ],
+  "hypotheses": [
+    {"statement": "The buffer size is 64 bytes based on local_40 variable", "confidence": 0.8}
+  ]
 }
 ```
+*(blockers = unresolved questions blocking progress; hypotheses = assumptions to verify)*
+
+{% if analysis_failure_reason %}
+---
+
+## ⚠️ RE-ANALYSIS CONTEXT (Exploit previously failed)
+
+**Failure reason:** {{ analysis_failure_reason }}
+
+{% if exploit_failure_context %}
+**Failed stage:** `{{ exploit_failure_context.stage_id }}`
+**Error:** {{ exploit_failure_context.error[:400] }}
+**Failing code:**
+```python
+{{ exploit_failure_context.code[:600] }}
+```
+{% endif %}
+
+**Your task:** Identify WHY the exploit failed and create tasks to fix the root cause.
+Common causes:
+- Wrong leak offset (leaked 0x0 → check bytes received, recvuntil pattern)
+- Wrong buffer offset to RIP (check with Pwndbg cyclic)
+- Wrong I/O interaction (check sendlineafter prompts match exactly)
+- Wrong libc base calculation (verify leaked symbol offset)
+{% endif %}
 
 ---
 
@@ -973,15 +1093,20 @@ PLAN_SYSTEM = env.from_string("""You are the **Plan Agent** for a pwnable CTF so
 
 | Priority | Task | Tool | Why |
 |----------|------|------|-----|
+| 0.98 | List files | `Run: ls -la` | Find provided files (libc, ld, etc.) **FIRST** |
 | 0.95 | Check protections | `Checksec` | Determines entire exploit strategy |
 | 0.90 | Decompile main | `Ghidra_main` | Understand program flow |
-| 0.85 | Check for libc | `Pwninit` | Sets up correct environment |
-| 0.80 | List files | `Run: ls -la` | Find provided files (libc, etc.) |
+| **0.90** | **Patch libc if provided** | `Pwninit` | **MANDATORY if libc.so.6 exists** — run BEFORE any exploit |
+
+**CRITICAL: Pwninit is MANDATORY when libc.so.6 is present.**
+- If `ls` shows `libc.so.6` or `libc-*.so` → immediately create Pwninit task (priority 0.90)
+- Pwninit patches the binary so local testing matches remote environment
+- Without this, leaked addresses and offsets will be WRONG
 
 **Checklist before moving to Phase 2:**
 - [ ] Checksec completed
 - [ ] Main function decompiled
-- [ ] Know if libc is provided
+- [ ] Pwninit run if libc.so.6 present
 
 ### Phase 2: VULNERABILITY HUNT
 **Goal: Find exploitable vulnerabilities + understand binary I/O**
@@ -1000,6 +1125,13 @@ PLAN_SYSTEM = env.from_string("""You are the **Plan Agent** for a pwnable CTF so
 - Note input methods (`scanf`, `read`, `gets`) and their formats
 - These are needed by Exploit Agent to generate correct `sendlineafter`/`recvuntil` calls
 - Store in analysis.io_patterns: `[{"prompt": "Size: ", "input_method": "scanf", "format": "%d"}, ...]`
+
+**CRITICAL: Record binary-specific overflow constraints in `exploit_constraints` and `exploit_mechanism`!**
+- If there is a size/length check (e.g., `if (len > 1000) break`), record it: `"len <= 1000"`
+- If the overflow works via a non-standard mechanism (e.g., repeat loop, loop counter overshoot), explain it:
+  - Example: `"exploit_mechanism": "pattern repeat overshoot — use pattern len L s.t. floor(limit/L)*L + L > target_offset; use target_len=limit to stay under the check"`
+- If the input is limited (e.g., `read(0, inp, 80)`), record: `"pattern length <= 80"`
+- **The exploit agent WILL try to send oversized payloads if it doesn't know these constraints!**
 
 **CRITICAL: Heap pointer structure (if heap vulnerability detected):**
 - Count how many chunk pointer variables exist: `void *chunk` (single) vs `void *chunks[N]` (array)
@@ -1048,14 +1180,20 @@ ptr->field = value;  // CRITICAL: Dangling pointer
   "tool": "Pwndbg",
   "args": {
     "commands": [
-      "run < <(python3 -c \"from pwn import *; print(cyclic(200).decode())\")",
+      "run < <(python3 -c \"from pwn import *; sys.stdout.buffer.write(cyclic(300))\")",
       "info registers rip rbp rsp",
-      "x/20gx $rsp"
+      "x/20gx $rsp",
+      "p/d (char*)$rip - (char*)0"
     ]
   }
 }
 ```
-Then use `cyclic_find(rip_value)` to get exact offset.
+Then use `cyclic_find(0xXXXXXXXX)` with the value in RIP to get exact offset.
+
+**If exploit previously failed with wrong offset:**
+- Re-run Pwndbg with cyclic to confirm actual offset
+- Check if binary has interactive menu — must send correct menu selections BEFORE overflow
+- Verify using `Pwndbg: b *vuln_function+N; run; x/gx $rsp` at the exact return point
 
 **Static Estimate (for reference only):**
 ```
@@ -1326,8 +1464,13 @@ PARSING_SYSTEM = env.from_string("""You are the **Parsing Agent** for a pwnable 
         "buffer_size": 64,
         "estimated_offset": 72,
         "code_snippet": "char buf[64]; gets(buf);",
-        "exploit_primitive": "control_rip"
+        "exploit_primitive": "control_rip",
+        "exploit_constraints": ["no input size limit"],
+        "exploit_mechanism": "standard linear overflow: payload = padding + ret_addr"
       }
+    ],
+    "io_patterns": [
+      {"prompt": "Enter input: ", "input_method": "gets", "format": ""}
     ],
     "offsets": {
       "buffer_to_rbp": 64,
@@ -1477,9 +1620,54 @@ Extract gadgets in structured format:
 6. **ROP gadgets**: pop rdi, pop rsi, ret
 7. **Libc symbols**: If libc provided, extract key offsets
 
+---
+
+## CRITICAL: Extract I/O Patterns, Constraints, and Mechanism
+
+### I/O Patterns (ALWAYS extract from decompiled code)
+When you see decompiled code with `printf`/`puts`/`write` for output and `scanf`/`read`/`gets`/`fgets` for input, extract exact prompt strings and input methods:
+```json
+{
+  "analysis_updates": {
+    "io_patterns": [
+      {"prompt": "Pattern: ", "input_method": "read", "format": "", "max_len": 80},
+      {"prompt": "Target length: ", "input_method": "scanf", "format": "%d"}
+    ]
+  }
+}
+```
+- `prompt`: EXACT string binary prints before input (copy from `printf`/`puts` arg)
+- `input_method`: `"scanf"`, `"read"`, `"gets"`, `"fgets"`, `"recv"`, etc.
+- `format`: scanf format if applicable (`"%d"`, `"%s"`, `"%lu"`, etc.)
+- `max_len`: max input bytes if `read(fd, buf, N)` or `fgets(buf, N, stdin)`
+
+### Exploit Constraints (extract when overflow mechanism is non-standard)
+If the overflow mechanism has restrictions, record them in the vulnerability entry:
+```json
+{
+  "vulnerabilities": [
+    {
+      "type": "buffer_overflow",
+      "exploit_constraints": [
+        "target_len must be <= 1000 (binary checks and breaks if larger)",
+        "pattern length must be <= 80 (read limit)"
+      ],
+      "exploit_mechanism": "describe how overflow actually works (standard, loop overshoot, etc.)"
+    }
+  ]
+}
+```
+**When to record these:**
+- Any input size hard limit: `if (len > N) break/exit` → record `"input <= N"`
+- Loop-based fill: `while(count < target) { copy(buf+count, inp, inp_len); count += inp_len; }` → record loop overshoot mechanism
+- Multi-stage input (menu, length then data): record each step's constraints
+- read() with explicit size: `read(0, buf, N)` → record `"input N bytes max"`
+
 ## Parsing Guidelines
 - Extract concrete values (addresses, sizes, offsets)
 - **ALWAYS calculate estimated offset when buffer size is known**
+- **ALWAYS extract I/O patterns** (prompts + input methods) from decompiled code
+- **ALWAYS record exploit_constraints** when you see input size limits or non-standard overflow mechanisms
 - Note protection status and exploitation implications
 - Keep code snippets concise but complete
 """)
@@ -1748,11 +1936,12 @@ Do NOT use `p.interactive()` — it hangs the subprocess and causes timeout.
 {
   "reasoning": "Exploitation strategy explanation",
   "exploit_type": "ret2libc",
-  "exploit_code": "...",
+  "exploit_code": "from pwn import *\\ncontext.log_level = 'debug'\\n...",
   "key_steps": ["1. ...", "2. ..."],
   "assumptions": ["Libc version: 2.31"]
 }
 ```
+**exploit_code MUST start with:** `from pwn import *` and `context.log_level = 'debug'`.
 
 ---
 
@@ -1763,6 +1952,7 @@ Do NOT use `p.interactive()` — it hangs the subprocess and causes timeout.
 
 ```python
 from pwn import *
+context.log_level = 'debug'
 
 context.binary = elf = ELF('{{ binary_path }}')
 libc = ELF('./libc.so.6')  # or libc = elf.libc
@@ -1815,6 +2005,7 @@ def solve():
 
 ```python
 from pwn import *
+context.log_level = 'debug'
 
 context.binary = elf = ELF('{{ binary_path }}')
 context.arch = 'amd64'  # or 'i386'
@@ -1842,6 +2033,7 @@ def solve():
 
 ```python
 from pwn import *
+context.log_level = 'debug'
 
 def solve():
     p = process(context.binary.path)
@@ -1868,6 +2060,7 @@ def solve():
 
 ```python
 from pwn import *
+context.log_level = 'debug'
 
 def solve():
     p = process(context.binary.path)
@@ -2031,6 +2224,7 @@ def solve():
 
 ## Exploit Code Guidelines
 - Use pwntools (`from pwn import *`)
+- **MANDATORY: `context.log_level = 'debug'`** — must be at the top of every exploit (right after imports) for I/O tracing
 - **CRITICAL: Use ABSOLUTE paths for binary** - `context.binary = '{{ binary_path }}'`
 - Include logging (`log.info`, `log.success`)
 - Add comments explaining each step
@@ -2139,6 +2333,28 @@ The previous exploit attempt **FAILED**. Here is the crash analysis:
 {% endif %}
 
 ---
+
+{% if blockers %}
+## Active Blockers (Unresolved Questions)
+{% for b in blockers %}
+{% if not b.resolved %}
+- ❓ **[UNRESOLVED]** {{ b.question }} *(severity: {{ b.severity | default(0.5) }})*
+{% endif %}
+{% endfor %}
+
+**Priority: Resolve the above blockers before moving forward.**
+
+---
+{% endif %}
+
+{% if hypotheses %}
+## Active Hypotheses (To Verify)
+{% for h in hypotheses %}
+- 🔬 {{ h.statement }} *(confidence: {{ h.confidence | default(0.5) }})*
+{% endfor %}
+
+---
+{% endif %}
 
 ## Pending Tasks
 {% if tasks %}
@@ -2374,7 +2590,10 @@ def build_analysis_document(state: SolverState) -> str:
         if key not in analysis:
             analysis[key] = val
 
-    return ANALYSIS_DOCUMENT_TEMPLATE.render(analysis=analysis)
+    # Include function_symbols from facts so Stage Identifier can see all function addresses
+    function_symbols = state.get("facts", {}).get("function_symbols", {})
+
+    return ANALYSIS_DOCUMENT_TEMPLATE.render(analysis=analysis, function_symbols=function_symbols)
 
 
 def build_analysis_summary(state: SolverState) -> str:
@@ -2458,6 +2677,8 @@ def build_messages(
         "challenge": state.get("challenge", {}),
         "binary_path": state.get("binary_path", ""),
         "docker_port": state.get("docker_port", 0),
+        "analysis_failure_reason": state.get("analysis_failure_reason", ""),
+        "exploit_failure_context": state.get("exploit_failure_context", {}),
     }
     system_content = system_templates[agent_lower].render(**system_context)
 
@@ -2493,6 +2714,10 @@ def _build_user_context(agent: str, state: SolverState, extra: Dict) -> Dict[str
             "tasks": state.get("tasks", []),
             "crash_analysis": state.get("crash_analysis", {}),
             "exploit_attempts": state.get("exploit_attempts", 0),
+            "blockers": state.get("blockers", []),
+            "hypotheses": state.get("hypotheses", []),
+            "analysis_failure_reason": state.get("analysis_failure_reason", ""),
+            "exploit_failure_context": state.get("exploit_failure_context", {}),
             **extra
         }
 
@@ -2616,8 +2841,19 @@ Each stage is independently verified before moving to the next.
   2. **write**: Tcache poison → overwrite __free_hook/__malloc_hook with one_gadget. Verify: confirmation.
   3. **trigger**: Trigger overwritten hook. Verify: shell.
 
-### Simple ret2win (no leak needed):
-1. **trigger**: Overflow → jump to win/flag function. Verify: flag or shell.
+### Simple ret2win (no PIE, no canary):
+1. **trigger**: Overflow → jump to win/flag function at fixed address. Verify: flag or shell.
+
+### ret2win with PIE (no canary):
+1. **pie_leak**: Overflow → leak return address from stack → calculate pie_base. Verify: valid binary address.
+2. **trigger**: Overflow → jump to pie_base + win_offset. Verify: flag or shell.
+
+### ret2win with canary + PIE:
+1. **canary_pie_leak**: Fill buffer to canary → read canary. Continue filling → read return address to get pie_base. Verify: both canary and pie_base non-zero.
+2. **trigger**: Overflow with [padding + canary + saved_rbp + (pie_base + win_offset)]. Verify: flag or shell.
+
+**CRITICAL: If analysis.win_function == true, you MUST use ret2win patterns above — NOT ret2libc.**
+The hints provided above will tell you exactly which pattern to use based on protections.
 
 ## CRITICAL: Heap Pointer Type Detection
 - Check the analysis document's "Heap Pointer Structure" section.
@@ -2704,7 +2940,7 @@ Your script MUST include equivalent logic before adding Stage {{ current_stage.s
 
 1. **COMPLETE script**: `from pwn import *` through `p.close()`. No missing imports.
 2. **Include ALL previous stages**: ASLR means addresses change each run → must re-do leak every time.
-3. **context.log_level = 'debug'**: MANDATORY for all scripts.
+3. **context.log_level = 'debug'**: MANDATORY — must appear right after `from pwn import *` at the top of every exploit script. Enables I/O tracing for debugging.
 4. **EXACT I/O strings**: Use strings from the decompiled code, never guess.
 5. **Prefer one_gadget** over system for hook overwrites (simpler).
 6. **NEVER use p.interactive()**: Hangs the subprocess.
@@ -2803,10 +3039,11 @@ Replace `<placeholders>` with EXACT strings from the decompiled code (e.g., `b"4
 ```json
 {
   "reasoning": "How this stage works",
-  "exploit_code": "from pwn import *\\n...",
+  "exploit_code": "from pwn import *\\ncontext.log_level = 'debug'\\n...",
   "key_steps": ["1. ...", "2. ..."]
 }
 ```
+**exploit_code MUST start with:** `from pwn import *` and `context.log_level = 'debug'` (mandatory for debug output).
 """)
 
 
@@ -2861,10 +3098,11 @@ The expected verification marker is: `{{ stage.verification_marker }}`
 ```json
 {
   "reasoning": "What went wrong and how to fix it",
-  "exploit_code": "from pwn import *\\n...(complete fixed script)",
+  "exploit_code": "from pwn import *\\ncontext.log_level = 'debug'\\n...(complete fixed script)",
   "changes_made": ["List of changes"]
 }
 ```
+**exploit_code MUST include** `context.log_level = 'debug'` immediately after imports.
 
 CRITICAL: NEVER use p.interactive(). After triggering shell, verify with:
 ```python
@@ -2894,6 +3132,7 @@ If the failing script uses `process()`, change it to `remote()`.
 {% endif %}
 
 Focus on:
+- **MUST keep `context.log_level = 'debug'`** in the fixed script (at top, after imports)
 - Incorrect I/O string matching (wrong menu strings)
 - Stack alignment issues (ret gadget)
 - Wrong offsets or addresses

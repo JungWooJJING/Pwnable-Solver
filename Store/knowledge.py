@@ -61,6 +61,34 @@ CHECKSEC_TECHNIQUES: Dict[str, Dict[str, Any]] = {
         "prerequisite": "Need a separate info leak for canary (format string, etc.)",
         "template_key": "canary_ret2libc",
     },
+    "bof_no_canary_no_pie_nx_win": {
+        "name": "ret2win (No PIE)",
+        "conditions": {"canary": False, "pie": False, "nx": True, "win_function": True},
+        "strategy": "ret2win",
+        "description": "Win function at fixed address → overflow directly to win",
+        "steps": [
+            "1. Find win/flag/backdoor function address (fixed, no leak needed)",
+            "2. Calculate offset to RIP",
+            "3. Overflow → return to win function address",
+        ],
+        "required_info": ["offset", "win_addr"],
+        "template_key": "ret2win",
+    },
+    "bof_no_canary_pie_nx_win": {
+        "name": "PIE Leak + ret2win",
+        "conditions": {"canary": False, "pie": True, "nx": True, "win_function": True},
+        "strategy": "pie_leak_ret2win",
+        "description": "Leak PIE base → calculate win function address → ret2win (no libc needed)",
+        "steps": [
+            "1. Find PIE base leak (format string, partial overwrite, printf leak, etc.)",
+            "2. Calculate pie_base from leaked address (leaked - known_offset)",
+            "3. Calculate win function: pie_base + win_offset",
+            "4. Overflow → return to win function (no libc leak needed)",
+        ],
+        "required_info": ["offset", "pie_leak_method", "win_offset"],
+        "prerequisite": "Need info leak for binary base address only (no libc required)",
+        "template_key": "pie_ret2win",
+    },
     "bof_no_canary_pie_nx": {
         "name": "PIE Leak + ret2libc",
         "conditions": {"canary": False, "pie": True, "nx": True},
@@ -75,6 +103,21 @@ CHECKSEC_TECHNIQUES: Dict[str, Dict[str, Any]] = {
         "required_info": ["offset", "pie_leak_method"],
         "prerequisite": "Need info leak for binary base address",
         "template_key": "pie_ret2libc",
+    },
+    "bof_canary_pie_nx_win": {
+        "name": "Canary + PIE Leak → ret2win",
+        "conditions": {"canary": True, "pie": True, "nx": True, "win_function": True},
+        "strategy": "canary_pie_leak_ret2win",
+        "description": "Leak canary + PIE base → ret2win (no libc needed)",
+        "steps": [
+            "1. Leak canary (partial overflow to overwrite null byte, then read)",
+            "2. Leak PIE base (read return address from stack after buffer fill)",
+            "3. Calculate win function address: pie_base + win_offset",
+            "4. Overflow: padding + canary + saved_rbp + win_addr",
+        ],
+        "required_info": ["canary_leak_method", "pie_leak_method", "offset", "win_offset"],
+        "prerequisite": "Need a leak primitive that reveals canary and a PIE address (printf %s or partial overwrite)",
+        "template_key": "canary_pie_ret2win",
     },
     "bof_canary_pie_nx": {
         "name": "Full Protection Bypass",
@@ -638,12 +681,13 @@ MODERN_TARGETS = {
 # Lookup Functions
 # =============================================================================
 
-def get_checksec_guide(checksec: Dict[str, Any]) -> Dict[str, Any]:
+def get_checksec_guide(checksec: Dict[str, Any], win_function: bool = False) -> Dict[str, Any]:
     """
     Given checksec results, recommend exploitation strategy.
 
     Args:
         checksec: dict with keys: nx, canary, pie, relro (from deterministic parser)
+        win_function: True if a win/flag/backdoor function exists in the binary
 
     Returns:
         Dict with strategy name, description, steps, required_info
@@ -665,17 +709,26 @@ def get_checksec_guide(checksec: Dict[str, Any]) -> Dict[str, Any]:
     elif relro == "partial":
         results["relro_note"] = "Partial RELRO: GOT is writable. GOT overwrite possible."
 
-    # Stack-based strategies
+    # Stack-based strategies — win_function variants take priority
     if not canary and not pie and nx:
-        results["recommended"].append(CHECKSEC_TECHNIQUES["bof_no_canary_no_pie_nx"])
+        if win_function:
+            results["recommended"].append(CHECKSEC_TECHNIQUES["bof_no_canary_no_pie_nx_win"])
+        else:
+            results["recommended"].append(CHECKSEC_TECHNIQUES["bof_no_canary_no_pie_nx"])
     elif not canary and not pie and not nx:
         results["recommended"].append(CHECKSEC_TECHNIQUES["bof_no_canary_no_pie_no_nx"])
     elif canary and not pie and nx:
         results["recommended"].append(CHECKSEC_TECHNIQUES["bof_canary_no_pie_nx"])
     elif not canary and pie and nx:
-        results["recommended"].append(CHECKSEC_TECHNIQUES["bof_no_canary_pie_nx"])
+        if win_function:
+            results["recommended"].append(CHECKSEC_TECHNIQUES["bof_no_canary_pie_nx_win"])
+        else:
+            results["recommended"].append(CHECKSEC_TECHNIQUES["bof_no_canary_pie_nx"])
     elif canary and pie and nx:
-        results["recommended"].append(CHECKSEC_TECHNIQUES["bof_canary_pie_nx"])
+        if win_function:
+            results["recommended"].append(CHECKSEC_TECHNIQUES["bof_canary_pie_nx_win"])
+        else:
+            results["recommended"].append(CHECKSEC_TECHNIQUES["bof_canary_pie_nx"])
 
     # Format string is always worth mentioning if applicable
     if relro != "full":
