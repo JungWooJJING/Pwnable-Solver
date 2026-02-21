@@ -110,6 +110,52 @@ def route_after_feedback(state: SolverState) -> Literal["plan", "stage_identify"
 
     exploit_readiness = state.get("exploit_readiness", {})
     if exploit_readiness.get("recommend_exploit", False):
+        # Hard block: canary or PIE requires dynamic verification before exploitation
+        analysis = state.get("analysis", {})
+        result_str = str(analysis.get("checksec", {}).get("result", "")).lower()
+        has_canary = "canary found" in result_str and "no canary" not in result_str
+        has_pie = "pie enabled" in result_str and "no pie" not in result_str
+
+        dv = analysis.get("dynamic_verification", {})
+        # Require verified flag AND actual numeric offset values populated by GDB
+        dv_complete = (
+            dv.get("verified") is True
+            and isinstance(dv.get("buf_offset_to_canary"), int)
+            and isinstance(dv.get("buf_offset_to_ret"), int)
+        )
+
+        # If we came back from a failed stage exploit, don't block on dv again —
+        # the LLM already understands the offsets from static/source analysis.
+        came_from_stage_failure = bool(state.get("exploit_failure_context"))
+
+        if (has_canary or has_pie) and not dv_complete and not came_from_stage_failure:
+            from rich.console import Console
+            _console = Console()
+
+            # Track how many times we've been forced back for GDB.
+            # After GDB_MAX_FORCE attempts, bypass the requirement and proceed with
+            # static analysis — prevents an infinite plan→gdb→plan loop when pwndbg
+            # fails to populate exact integer offsets (e.g. interactive binary, no source).
+            GDB_MAX_FORCE = 2
+            gdb_forced = state.get("gdb_forced_count", 0)
+
+            if gdb_forced >= GDB_MAX_FORCE:
+                _console.print(
+                    f"[yellow]⚠ Dynamic verification still incomplete after {gdb_forced} GDB "
+                    f"attempt(s) — proceeding with static analysis only[/yellow]"
+                )
+                return "stage_identify"
+
+            state["gdb_forced_count"] = gdb_forced + 1
+            _console.print(
+                "[yellow]⚠ Canary/PIE detected but dynamic_verification incomplete "
+                f"(verified={dv.get('verified')}, "
+                f"canary_offset={dv.get('buf_offset_to_canary')}, "
+                f"ret_offset={dv.get('buf_offset_to_ret')}) "
+                f"— forcing GDB run before exploit (attempt {gdb_forced + 1}/{GDB_MAX_FORCE})[/yellow]"
+            )
+            return "plan"
+
         return "stage_identify"
 
     return "end"

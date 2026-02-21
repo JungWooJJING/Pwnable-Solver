@@ -697,8 +697,11 @@ def compute_readiness(analysis: Analysis, runs: Optional[List] = None) -> Tuple[
         Tier 1 (+0.25): checksec done, vuln found, vuln type known
         Tier 2 (+0.25): offset/detail known, control primitive identified
         Tier 3 (+0.25): gadgets (if NX), leak method (if needed), libc (if needed)
-        Tier 4 (+0.15): dynamic verification (Pwndbg executed)
-        Tier 5 (+0.1): strategy clear
+        Tier 4 (+0.20): dynamic verification (Pwndbg executed) — increased weight
+        Tier 5 (+0.05): strategy clear
+
+    Note: For canary/PIE binaries, route_after_feedback() hard-blocks stage_identify
+    until dynamic_verification.verified is True, regardless of this score.
     """
     completed: List[str] = []
     missing: List[str] = []
@@ -840,29 +843,34 @@ def compute_readiness(analysis: Analysis, runs: Optional[List] = None) -> Tuple[
             # Checksec not done yet → can't determine tier 3
             missing.append("tier3_unknown_until_checksec")
 
-    # --- Tier 4: Dynamic Verification (+0.15) ---
+    # --- Tier 4: Dynamic Verification (+0.20) ---
     # Primary check: LLM has extracted and stored verified runtime values
     dv = analysis.get("dynamic_verification", {})
     has_dynamic = bool(dv.get("verified"))
-    # Fallback: any Pwndbg/GDB run recorded (partial credit)
+    # Fallback: any Pwndbg/GDB run recorded (partial credit — half score)
+    has_gdb_run = False
     if not has_dynamic and runs:
         for run in runs:
             cmds = run.get("commands", [])
             cmd_str = " ".join(str(c) for c in cmds).lower()
             if "pwndbg" in cmd_str or "gdb" in cmd_str:
-                has_dynamic = True
+                has_gdb_run = True
                 break
 
     if has_dynamic:
         completed.append("dynamic_verification_done")
-        score += 0.15
+        score += 0.20
+    elif has_gdb_run:
+        # GDB was run but values not yet parsed/stored — partial credit
+        completed.append("dynamic_verification_partial")
+        score += 0.10
     else:
         missing.append("dynamic_verification_done")
 
-    # --- Tier 5: Strategy (+0.1) ---
+    # --- Tier 5: Strategy (+0.05) ---
     if strategy:
         completed.append("exploit_strategy_clear")
-        score += 0.1
+        score += 0.05
     else:
         missing.append("exploit_strategy_clear")
 

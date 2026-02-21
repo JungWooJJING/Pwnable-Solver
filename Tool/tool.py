@@ -388,20 +388,98 @@ class Tool:
         if not self.binary_path:
             return "Error: binary_path is not set"
 
+        # 분석 컨테이너가 실행 중이면 docker exec로 실행
+        slug = self._slug(Path(self.binary_path).stem)
+        analysis_container = f"pwn_{slug}_analysis"
+        if self._is_container_running(analysis_container):
+            container_workdir = self._get_container_workdir(analysis_container)
+            binary_name = Path(self.binary_path).name
+            binary_in_container = f"{container_workdir}/{binary_name}"
+            console.print(
+                f"[cyan]Pwndbg: using analysis container "
+                f"({analysis_container}, binary={binary_in_container})[/cyan]"
+            )
+            return self._pwndbg_docker(
+                commands, analysis_container, binary_in_container, timeout
+            )
+
+        # fallback: 호스트에서 직접 실행
+        console.print("[dim]Pwndbg: analysis container not found — running on host[/dim]")
+        return self._pwndbg_host(commands, timeout)
+
+    def _pwndbg_host(self, commands: Optional[list[str]] = None, timeout: int = 30) -> str:
+        """호스트 GDB(pwndbg)로 실행."""
         cmds = list(commands or [])
-        cmd = ["gdb", "-q", "-nx", "-batch", "-ex", "set pagination off", "-ex", "set confirm off"]
+        # NOTE: do NOT use -nx — it skips .gdbinit and prevents pwndbg from loading.
+        # pwndbg extensions (vmmap, heap, bins, etc.) require .gdbinit to be sourced.
+        cmd = ["gdb", "-q", "-batch", "-ex", "set pagination off", "-ex", "set confirm off"]
         for c in cmds:
             cmd += ["-ex", c]
         cmd += ["--args", self.binary_path]
 
+        import resource
+
+        def _enable_core():
+            try:
+                resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+            except Exception:
+                pass
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=timeout,
+                preexec_fn=_enable_core,
+            )
+        except subprocess.TimeoutExpired:
+            return "Error: gdb timed out — binary likely blocked waiting for stdin input"
         except FileNotFoundError:
             return "Error: gdb not found"
         out = (result.stdout or "").strip()
         err = (result.stderr or "").strip()
         combined = out if out else err
         self._write_artifact("pwndbg", combined, suffix=".txt")
+        return combined
+
+    def _pwndbg_docker(
+        self,
+        commands: Optional[list[str]],
+        container_name: str,
+        binary_in_container: str,
+        timeout: int,
+    ) -> str:
+        """분석 컨테이너 내부에서 docker exec로 GDB(pwndbg) 실행."""
+        cmds = list(commands or [])
+        # docker exec -i 로 stdin을 닫은 채 실행
+        cmd = [
+            "docker", "exec", container_name,
+            "gdb", "-q", "-batch",
+            "-ex", "set pagination off",
+            "-ex", "set confirm off",
+        ]
+        for c in cmds:
+            cmd += ["-ex", c]
+        cmd += ["--args", binary_in_container]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return "Error: gdb (docker) timed out — binary likely blocked waiting for stdin input"
+        except FileNotFoundError:
+            return "Error: docker not found"
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        combined = out if out else err
+        self._write_artifact("pwndbg_docker", combined, suffix=".txt")
         return combined
 
     def One_gadget(self) -> str:
@@ -664,6 +742,138 @@ To stop:
         if not combined.strip():
             return "No pwn containers found"
         return combined
+
+    # -------------------------------------------------------------------------
+    # 분석 환경 Docker (pwndbg 포함 — 챌린지 이미지 기반)
+    # -------------------------------------------------------------------------
+
+    def _is_container_running(self, container_name: str) -> bool:
+        """컨테이너가 실행 중인지 확인."""
+        stdout, _, rc = self._run_and_capture(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            timeout=5,
+        )
+        return stdout.strip() == "true"
+
+    def _get_container_workdir(self, container_name: str) -> str:
+        """docker inspect으로 컨테이너의 WorkingDir 반환."""
+        stdout, _, rc = self._run_and_capture(
+            ["docker", "inspect", "-f", "{{.Config.WorkingDir}}", container_name],
+            timeout=5,
+        )
+        return stdout.strip() or "/challenge"
+
+    def Docker_setup_analysis(self, timeout: int = 600) -> str:
+        """
+        챌린지 이미지를 베이스로 pwndbg 포함 분석 환경 컨테이너 빌드 및 실행.
+
+        - 챌린지 이미지(pwn_{slug})가 먼저 빌드되어 있어야 함 (Docker_setup 선행)
+        - FROM pwn_{slug} 위에 gdb + pwndbg 레이어를 추가해 분석 이미지 생성
+        - 컨테이너는 상시 실행 상태로 유지 (tail -f /dev/null)
+        - Pwndbg()가 이 컨테이너를 자동 감지해 docker exec로 실행
+
+        Args:
+            timeout: pwndbg 빌드 타임아웃(초) — 첫 빌드는 수 분 소요
+        """
+        if not self.binary_path:
+            return "Error: binary_path is not set"
+
+        slug = self._slug(Path(self.binary_path).stem)
+        challenge_image = f"pwn_{slug}"
+        analysis_image = f"pwn_{slug}_analysis"
+        analysis_container = f"pwn_{slug}_analysis"
+
+        # 챌린지 이미지 존재 확인
+        stdout, _, rc = self._run_and_capture(
+            ["docker", "image", "inspect", challenge_image], timeout=5
+        )
+        if rc != 0:
+            return (
+                f"Error: Challenge image '{challenge_image}' not found. "
+                "Run Docker_setup() first."
+            )
+
+        # 기존 분석 컨테이너 정리
+        subprocess.run(["docker", "rm", "-f", analysis_container], capture_output=True)
+
+        # 분석 Dockerfile (stdin으로 전달 — 파일 생성 없음)
+        analysis_dockerfile = f"""\
+FROM {challenge_image}
+
+RUN apt-get update -qq && \\
+    apt-get install -y gdb python3 python3-pip git wget curl sudo && \\
+    rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/pwndbg/pwndbg.git /pwndbg && \\
+    cd /pwndbg && ./setup.sh
+
+CMD ["tail", "-f", "/dev/null"]
+"""
+        console.print(f"[cyan]Building analysis image: {analysis_image}[/cyan]")
+        console.print("[dim]  (pwndbg 빌드 중 — 첫 실행 시 수 분 소요)[/dim]")
+
+        try:
+            build_result = subprocess.run(
+                ["docker", "build", "-t", analysis_image, "-"],
+                input=analysis_dockerfile,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return f"Error: Analysis image build timed out after {timeout}s"
+
+        if build_result.returncode != 0:
+            err = (build_result.stderr or build_result.stdout or "").strip()
+            return f"Error: Analysis image build failed\n{err}"
+
+        console.print(f"[green]Analysis image built: {analysis_image}[/green]")
+
+        # 분석 컨테이너 실행 (챌린지 workdir 볼륨 마운트)
+        workdir = Path(self.binary_path).resolve().parent
+        # 챌린지 컨테이너에서 workdir 감지 (challenge 컨테이너가 있는 경우)
+        challenge_container = f"pwn_{slug}_container"
+        container_workdir = "/challenge"
+        if self._is_container_running(challenge_container):
+            container_workdir = self._get_container_workdir(challenge_container)
+
+        run_cmd = [
+            "docker", "run", "-d",
+            "--name", analysis_container,
+            "-v", f"{workdir}:{container_workdir}",
+            analysis_image,
+        ]
+        stdout, stderr, rc = self._run_and_capture(run_cmd, timeout=30)
+        if rc != 0:
+            err = stderr or stdout
+            return f"Error: Failed to start analysis container\n{err}"
+
+        container_id = stdout.strip()[:12]
+        binary_name = Path(self.binary_path).name
+        binary_in_container = f"{container_workdir}/{binary_name}"
+
+        result = (
+            f"[SUCCESS] Analysis container ready!\n"
+            f"\n"
+            f"Container : {analysis_container} (ID: {container_id})\n"
+            f"Image     : {analysis_image}\n"
+            f"Binary    : {binary_in_container}\n"
+            f"\n"
+            f"Pwndbg() calls will now automatically use this container.\n"
+            f"To stop: docker stop {analysis_container}\n"
+        )
+        console.print(f"[green]{result}[/green]")
+        self._write_artifact("docker_analysis_setup", result, suffix=".txt")
+        return result
+
+    def Docker_stop_analysis(self) -> str:
+        """분석 컨테이너 중지 및 삭제."""
+        if not self.binary_path:
+            return "Error: binary_path is not set"
+        slug = self._slug(Path(self.binary_path).stem)
+        analysis_container = f"pwn_{slug}_analysis"
+        subprocess.run(["docker", "rm", "-f", analysis_container], capture_output=True)
+        return f"[SUCCESS] Analysis container '{analysis_container}' removed"
 
     # =============================================================================
     # 범용 Bash 명령 실행기

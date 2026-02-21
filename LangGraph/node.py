@@ -133,13 +133,25 @@ def Plan_node(
     """
     console.print(Panel("Plan Node", style="bold magenta"))
 
+    # --- Guard: restore binary_path from original if LLM drifted it ---
+    orig_binary = state.get("original_binary_path", "")
+    if orig_binary and state.get("binary_path", "") != orig_binary:
+        console.print(f"[yellow]⚠ binary_path drifted → restoring to original: {orig_binary}[/yellow]")
+        state["binary_path"] = orig_binary
+
     binary_path = state.get("binary_path", "")
 
-    # First iteration initialization
-    if not state.get("loop", False):
+    # First iteration initialization — use recon_done to guard RECON,
+    # NOT loop, because Feedback sets loop=False when ready for exploit
+    # and the dynamic_verification gate can route back to Plan with loop=False.
+    if not state.get("recon_done", False):
         console.print("[green]Initializing Plan Node...[/green]")
 
-        # Get directory listing
+        # Lock the binary_path so LLMs cannot change it later
+        if binary_path and not state.get("original_binary_path"):
+            state["original_binary_path"] = binary_path
+
+        # Get directory listing (filter core dumps to prevent LLM confusion)
         if binary_path:
             workdir = str(Path(binary_path).resolve().parent)
             ls_result = subprocess.run(
@@ -148,14 +160,24 @@ def Plan_node(
                 text=True,
                 cwd=workdir
             )
-            state["directory_listing"] = ls_result.stdout.strip()
+            raw_listing = ls_result.stdout or ""
+            # Filter out core dump files and pwntools _patched copies so the LLM
+            # doesn't mistake them for real binaries (core.* / *_patched / *_ghidra dirs)
+            filtered_lines = [
+                line for line in raw_listing.splitlines()
+                if not any(
+                    part in line
+                    for part in ("_patched", "_ghidra", " core.", "/core.")
+                ) or line.startswith("total")
+            ]
+            state["directory_listing"] = "\n".join(filtered_lines)
             state["cwd"] = workdir
 
-            # Save to Challenge directory
+            # Save full (unfiltered) listing to disk for debugging
             try:
                 out_dir = _challenge_dir_for_state(state)
                 (out_dir / "directory_listing.txt").write_text(
-                    (ls_result.stdout or "") +
+                    raw_listing +
                     ("\n\n--- STDERR ---\n" + (ls_result.stderr or "") if ls_result.stderr else ""),
                     encoding="utf-8",
                     errors="replace",
@@ -167,6 +189,7 @@ def Plan_node(
         if not state.get("analysis"):
             state["analysis"] = init_analysis()
 
+        state["recon_done"] = True
         state["loop"] = True
         state["iteration_count"] = 1
 
@@ -176,6 +199,9 @@ def Plan_node(
 
     else:
         state["iteration_count"] = state.get("iteration_count", 0) + 1
+        # Ensure loop stays True during re-analysis after stage failures
+        if not state.get("loop"):
+            state["loop"] = True
 
     console.print(f"[dim]Iteration: {state['iteration_count']}[/dim]")
 
@@ -246,7 +272,7 @@ def _run_phase1_recon(state: State, binary_path: str) -> None:
             merge_analysis_updates(state, {
                 "decompile": {
                     "done": True,
-                    "functions": [{"name": "main", "address": "", "code": str(ghidra_raw)[:3000]}],
+                    "functions": [{"name": "main", "address": "", "code": str(ghidra_raw)[:8000]}],
                 }
             })
             preview = str(ghidra_raw)[:500]
@@ -358,6 +384,25 @@ def _run_phase1_recon(state: State, binary_path: str) -> None:
 
     except Exception as e:
         console.print(f"[yellow]Symbol scan failed: {e}[/yellow]")
+
+    # --- Source Code Discovery ---
+    # Read any .c source files in the binary's directory and store in state so all
+    # agents (Plan, Instruction, Stage Exploit) can use the ground-truth I/O protocol.
+    try:
+        import glob as _g
+        workdir = str(Path(binary_path).resolve().parent)
+        for c_file in _g.glob(str(Path(workdir) / "*.c")):
+            source_code = Path(c_file).read_text(encoding="utf-8", errors="replace")[:5000]
+            facts = state.get("facts", {})
+            facts["source_code"] = source_code
+            facts["source_code_file"] = str(c_file)
+            state["facts"] = facts
+            console.print(f"[green]Source code found: {c_file}[/green]")
+            # Also store in analysis so LLM agents can access it easily
+            merge_analysis_updates(state, {"source_code_available": True, "source_code_path": str(c_file)})
+            break
+    except Exception:
+        pass
 
     console.print("[green]Phase 1 RECON complete - Plan Agent starts at Phase 2[/green]")
 
@@ -946,6 +991,157 @@ def Stage_exploit_node(
     return state
 
 
+def _looks_like_ascii_text(val: int, width: int = 8) -> bool:
+    """
+    Returns True if val's bytes are mostly printable ASCII (likely reading prompt text
+    instead of a real binary value such as a stack canary or address).
+
+    Real canary: first byte \\x00, remaining 7 bytes random (rarely all printable).
+    Real address: contains many high-byte values (0x7f... etc.), rarely all printable.
+    """
+    try:
+        raw = val.to_bytes(width, "little")
+    except (OverflowError, ValueError):
+        return False
+    printable = sum(1 for b in raw if 0x20 <= b <= 0x7e or b in (0x09, 0x0a, 0x0d))
+    return printable >= width - 1  # ≥ 7/8 bytes printable → almost certainly text
+
+
+def _extract_last_hex_dump(combined: str) -> str:
+    """
+    Extract the last pwnlib hexdump block from exploit output.
+    Returns a compact summary of the received bytes for Stage Refine context.
+    Pwnlib format:
+      [DEBUG] Received 0x41f bytes:
+          00000000  41 41 41 ...  │AAAA│...│
+          *
+          00000410  f8 5f ...     │····│
+          0000041f
+    """
+    import re as _re
+    # Match "[DEBUG] Received N bytes:" followed by hex lines
+    pattern = _re.compile(
+        r"\[DEBUG\] (Received|Sent) (0x[0-9a-fA-F]+|\d+) bytes:\n((?:[ \t]+[^\n]+\n)*)",
+        _re.MULTILINE,
+    )
+    matches = list(pattern.finditer(combined))
+    if not matches:
+        return ""
+
+    # Get the last 3 Received blocks (most recent interactions)
+    received = [m for m in matches if m.group(1) == "Received"]
+    if not received:
+        return ""
+
+    blocks = received[-3:]  # last 3 received blocks
+    result_parts = []
+    for m in blocks:
+        size_str = m.group(2)
+        hex_lines = m.group(3)
+        result_parts.append(f"[DEBUG] Received {size_str} bytes:\n{hex_lines.rstrip()}")
+
+    summary = "\n\n".join(result_parts)
+    return summary
+
+
+def _find_hardcoded_pie_base(exploit_path: str) -> str:
+    """
+    Scan exploit code for hardcoded PIE base addresses when PIE/ASLR is enabled.
+    Returns a warning string if found, empty string otherwise.
+    """
+    import re as _re
+    try:
+        code = Path(exploit_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+    # 0x555555554000: most common ASLR-off debug PIE base
+    # Also catch `pie_base = 0x<static>`, `binary_base = 0x<static>`
+    checks = [
+        (r'0x555555554000', "0x555555554000 is the ASLR-off debug PIE base"),
+        (r'(?:pie_base|binary_base|base_addr)\s*=\s*(0x[0-9a-f]{6,12})\b', "hardcoded base"),
+    ]
+    for pat, label in checks:
+        m = _re.search(pat, code, _re.IGNORECASE)
+        if not m:
+            continue
+        # Skip if immediately followed by arithmetic (might be offset computation)
+        tail = code[m.end():m.end() + 5].strip()
+        if tail and tail[0] in "+-*/":
+            continue
+        matched_val = m.group(1) if m.lastindex else m.group(0)
+        return (
+            f"\n\n[!] HARDCODED PIE BASE DETECTED ({label} = {matched_val}). "
+            f"With ASLR enabled the base changes every run — it MUST be computed from a "
+            f"dynamically leaked return address or binary address, not a fixed constant. "
+            f"The stage will likely fail unless PIE/ASLR is verified to be disabled."
+        )
+    return ""
+
+
+def _analyze_core_if_exists(binary_path: str, search_dirs: list, since: float) -> str:
+    """
+    Core dump 파일이 있으면 GDB로 분석하여 crash 정보를 반환.
+    없으면 빈 문자열 반환 (caller가 fallback 처리).
+
+    Args:
+        binary_path: 바이너리 경로
+        search_dirs: core 파일 탐색 디렉토리 목록
+        since: 이 시각 이후 생성된 core 파일만 대상 (epoch seconds)
+    """
+    import glob, time as _t
+
+    core_file = None
+    for d in search_dirs:
+        candidates = list(Path(d).glob("core*")) + list(Path(d).glob("vgcore*"))
+        for c in candidates:
+            try:
+                if c.stat().st_mtime >= since - 1:  # 1초 여유
+                    core_file = c
+                    break
+            except OSError:
+                continue
+        if core_file:
+            break
+
+    if not core_file:
+        return ""
+
+    console.print(f"[green]Core dump found: {core_file} — running GDB analysis[/green]")
+
+    gdb_cmds = [
+        "set pagination off",
+        f"file {binary_path}",
+        f"core-file {core_file}",
+        "info registers rip rsp rbp",
+        "x/20gx $rsp",
+        "bt",
+        "info signal",
+    ]
+    cmd = ["gdb", "-q", "-batch"] + [arg for c in gdb_cmds for arg in ["-ex", c]]
+    analysis_result = ""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        result = out if out else err
+        analysis_result = f"\n\n=== GDB CRASH ANALYSIS (core: {core_file.name}) ===\n{result}\n=== END GDB ANALYSIS ==="
+    except Exception as e:
+        analysis_result = f"\n[Core dump found at {core_file} but GDB analysis failed: {e}]"
+
+    # Move core file to a 'cores' subdirectory so it doesn't pollute the binary dir
+    # and prevent Plan agent from mistaking it for a binary on the next iteration.
+    try:
+        cores_dir = core_file.parent / "cores"
+        cores_dir.mkdir(exist_ok=True)
+        core_file.rename(cores_dir / core_file.name)
+        console.print(f"[dim]Core file moved to {cores_dir / core_file.name}[/dim]")
+    except Exception:
+        pass  # Non-critical — analysis already captured
+
+    return analysis_result
+
+
 def Stage_verify_node(
     state: State,
     model: Optional[str] = None,
@@ -981,15 +1177,40 @@ def Stage_verify_node(
         state["staged_exploit"]["stages"] = stages
         return state
 
+    binary_path = state.get("binary_path", "")
+    _core_search_dirs = [str(Path(exploit_path).parent), "/tmp"]
+    if binary_path:
+        _core_search_dirs.insert(0, str(Path(binary_path).parent))
+    _run_start = 0.0
+
+    # Pre-run: detect hardcoded PIE base when PIE is enabled
+    analysis = state.get("analysis", {})
+    result_str = str(analysis.get("checksec", {}).get("result", "")).lower()
+    _has_pie = "pie enabled" in result_str and "no pie" not in result_str
+    _pie_warn = ""
+    if _has_pie:
+        _pie_warn = _find_hardcoded_pie_base(exploit_path)
+        if _pie_warn:
+            console.print(f"[yellow]⚠ {_pie_warn.strip()}[/yellow]")
+
     console.print(f"[cyan]Running Stage {current_idx+1}: {current_stage['stage_id']}...[/cyan]")
 
     # Run the script
     try:
+        import resource, time as _time
         env = os.environ.copy()
         # Docker 모드: TARGET_HOST/TARGET_PORT 환경변수 주입
         if state.get("docker_port"):
             env["TARGET_HOST"] = "localhost"
             env["TARGET_PORT"] = str(state.get("docker_port", 1337))
+
+        def _enable_core():
+            try:
+                resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+            except Exception:
+                pass
+
+        _run_start = _time.time()
         result = subprocess.run(
             ["python3", exploit_path],
             capture_output=True,
@@ -997,6 +1218,7 @@ def Stage_verify_node(
             timeout=60,
             cwd=str(Path(exploit_path).parent),
             env=env,
+            preexec_fn=_enable_core,
         )
         stdout = result.stdout or ""
         stderr = result.stderr or ""
@@ -1007,7 +1229,6 @@ def Stage_verify_node(
 
         # Probe the binary to capture its actual I/O output so the refiner can
         # identify wrong recvuntil() strings (the most common cause of timeout).
-        binary_path = state.get("binary_path", "")
         if binary_path and Path(binary_path).exists():
             try:
                 import pty, os as _os, select as _sel, time as _t
@@ -1048,6 +1269,11 @@ def Stage_verify_node(
 
         current_stage["verified"] = False
         current_stage["error"] = combined
+        current_stage["last_hex_dump"] = _extract_last_hex_dump(combined)
+        # Opportunistic crash analysis
+        _crash_info = _analyze_core_if_exists(binary_path, _core_search_dirs, _run_start)
+        if _crash_info:
+            current_stage["error"] += _crash_info
         stages[current_idx] = current_stage
         state["staged_exploit"]["stages"] = stages
         return state
@@ -1056,6 +1282,10 @@ def Stage_verify_node(
         console.print(f"[red]{combined}[/red]")
         current_stage["verified"] = False
         current_stage["error"] = combined
+        # Opportunistic crash analysis
+        _crash_info = _analyze_core_if_exists(binary_path, _core_search_dirs, _run_start)
+        if _crash_info:
+            current_stage["error"] += _crash_info
         stages[current_idx] = current_stage
         state["staged_exploit"]["stages"] = stages
         return state
@@ -1116,6 +1346,7 @@ def Stage_verify_node(
             console.print(f"[red]Stage {current_idx+1} FAILED (code reported STAGE_FAILED)[/red]")
             current_stage["verified"] = False
             current_stage["error"] = combined
+            current_stage["last_hex_dump"] = _extract_last_hex_dump(combined)
         elif has_marker:
             # Additional heuristic: for leak stages, check if leaked values are valid
             stage_id_lower = current_stage.get("stage_id", "").lower()
@@ -1129,8 +1360,57 @@ def Stage_verify_node(
                         marker_line = line
                         break
 
-                # For canary_pie_leak: validate pie_leak specifically (canary is always non-zero)
-                if "canary_pie" in stage_id_lower or "pie" in stage_id_lower:
+                # For canary_pie_leak: validate both canary AND pie_leak
+                if "canary_pie" in stage_id_lower or "canary" in stage_id_lower or "pie" in stage_id_lower:
+                    # --- Canary validation ---
+                    canary_match = re.search(r"canary=0x([0-9a-fA-F]+)", marker_line)
+                    if canary_match:
+                        canary_val = int(canary_match.group(1), 16)
+                        if _looks_like_ascii_text(canary_val):
+                            console.print(f"[red]Stage {current_idx+1} FAILED (canary=0x{canary_val:x} looks like ASCII text — I/O desync, reading prompt instead of canary)[/red]")
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"canary=0x{canary_val:x} bytes look like printable ASCII text "
+                                f"(little-endian: {list(canary_val.to_bytes(8, 'little'))}). "
+                                f"This means recvn()/recv() is reading the prompt string, not the canary. "
+                                f"Fix: consume all output up to the NEXT prompt with recvuntil(), "
+                                f"then slice bytes at the correct offset.\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
+                        elif (canary_val & 0xff) != 0:
+                            console.print(f"[red]Stage {current_idx+1} FAILED (canary=0x{canary_val:x} LSB is not \\x00 — stack canary always ends with null byte)[/red]")
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"canary=0x{canary_val:x} has non-zero LSB (0x{canary_val & 0xff:02x}). "
+                                f"Real stack canary always has \\x00 as its first (lowest) byte. "
+                                f"Check that u64() is applied correctly and the right bytes are being extracted.\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
+
+                    # --- Raw return address validation (before masking) ---
+                    raw_ret_match = re.search(r"raw_ret=0x([0-9a-fA-F]+)", marker_line)
+                    if raw_ret_match:
+                        raw_ret_val = int(raw_ret_match.group(1), 16)
+                        raw_bytes = raw_ret_val.to_bytes(8, "little")
+                        printable = sum(1 for b in raw_bytes if 0x20 <= b <= 0x7e)
+                        if printable >= 6:
+                            console.print(f"[red]Stage {current_idx+1} FAILED (raw_ret=0x{raw_ret_val:x} has {printable}/8 printable bytes — reading prompt text, not return address)[/red]")
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"raw_ret=0x{raw_ret_val:x} bytes: {list(raw_bytes[:6])} — {printable}/8 printable. "
+                                f"This is prompt text, not a real return address. "
+                                f"printf stopped at a null byte before reaching the return address (likely in saved RBP). "
+                                f"The return address was never in the received output.\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
+
+                    # --- PIE base validation ---
                     pie_match = re.search(r"pie_leak=0x([0-9a-fA-F]+)", marker_line)
                     if pie_match:
                         pie_val = int(pie_match.group(1), 16)
@@ -1138,11 +1418,39 @@ def Stage_verify_node(
                             console.print(f"[red]Stage {current_idx+1} FAILED (pie_leak=0x{pie_val:x} is invalid — likely wrong offset)[/red]")
                             current_stage["verified"] = False
                             current_stage["error"] = f"pie_leak=0x{pie_val:x} is invalid (too small — check leak offset)\n" + combined
+                        elif _looks_like_ascii_text(pie_val):
+                            console.print(f"[red]Stage {current_idx+1} FAILED (pie_leak=0x{pie_val:x} looks like ASCII text — I/O desync)[/red]")
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"pie_leak=0x{pie_val:x} bytes look like printable ASCII text — I/O desync.\n"
+                            ) + combined
+                        elif (pie_val & 0xfff) != 0:
+                            console.print(f"[red]Stage {current_idx+1} FAILED (pie_leak=0x{pie_val:x} is not page-aligned — binary base must end in 000)[/red]")
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"pie_leak=0x{pie_val:x} is not page-aligned (0x{pie_val & 0xfff:x} != 0). "
+                                f"PIE base is always a multiple of 0x1000. "
+                                f"Apply: pie_base = leaked_addr & ~0xfff (mask low 12 bits) or subtract the correct static offset.\n"
+                            ) + combined
                         else:
                             console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, pie_leak=0x{pie_val:x})[/bold green]")
                             current_stage["verified"] = True
                     else:
-                        # No pie_leak= field — fall back to any hex value check
+                        # canary/pie 스테이지인데 마커에 pie_leak= 필드가 없으면 FAIL
+                        # → LLM이 print("STAGE1_OK") 처럼 값 없이 마커만 출력한 경우
+                        if "pie" in stage_id_lower or "canary_pie" in stage_id_lower:
+                            console.print(f"[red]Stage {current_idx+1} FAILED (marker '{marker}' found but missing 'pie_leak=0x...' field — exploit must include validated PIE base in the marker)[/red]")
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"Stage marker '{marker}' was found but the line contains no 'pie_leak=0x...' value. "
+                                f"The exploit code must print the marker WITH the leaked values for validation:\n"
+                                f"  print(f\"{marker} canary=0x{{canary:016x}} pie_leak=0x{{pie_base:x}}\")\n"
+                                f"Do NOT print the marker unconditionally — only print it after confirming the leak succeeded.\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
+                        # 일반 leak 스테이지: 마커 라인의 첫 번째 hex 값으로 폴백
                         addr_match = re.search(r"0x([0-9a-fA-F]+)", marker_line)
                         if addr_match:
                             addr_val = int(addr_match.group(1), 16)
@@ -1154,8 +1462,21 @@ def Stage_verify_node(
                                 console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, addr=0x{addr_val:x})[/bold green]")
                                 current_stage["verified"] = True
                         else:
-                            console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found)[/bold green]")
-                            current_stage["verified"] = True
+                            # hex 값도 없음 → canary가 포함된 스테이지면 FAIL
+                            if "canary" in stage_id_lower:
+                                console.print(f"[red]Stage {current_idx+1} FAILED (marker '{marker}' found but no hex values — missing canary/pie output)[/red]")
+                                current_stage["verified"] = False
+                                current_stage["error"] = (
+                                    f"Stage marker '{marker}' found but no hex values detected in the marker line.\n"
+                                    f"For canary/PIE leak stages, the marker MUST include the leaked values:\n"
+                                    f"  print(f\"{marker} canary=0x{{canary:016x}} pie_leak=0x{{pie_base:x}}\")\n"
+                                ) + combined
+                                stages[current_idx] = current_stage
+                                state["staged_exploit"]["stages"] = stages
+                                return state
+                            else:
+                                console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found)[/bold green]")
+                                current_stage["verified"] = True
                 else:
                     # Generic leak stage: check first hex value
                     addr_match = re.search(r"0x([0-9a-fA-F]+)", marker_line)
@@ -1178,9 +1499,23 @@ def Stage_verify_node(
             console.print(f"[red]Stage {current_idx+1} FAILED (marker '{marker}' not found)[/red]")
             current_stage["verified"] = False
             current_stage["error"] = combined
+            current_stage["last_hex_dump"] = _extract_last_hex_dump(combined)
 
     stages[current_idx] = current_stage
     state["staged_exploit"]["stages"] = stages
+
+    # Opportunistic crash analysis + pre-run warnings for any non-early-return failure path
+    if not current_stage.get("verified"):
+        _crash_info = _analyze_core_if_exists(binary_path, _core_search_dirs, _run_start)
+        suffix = ""
+        if _pie_warn:
+            suffix += _pie_warn
+        if _crash_info:
+            suffix += _crash_info
+        if suffix:
+            current_stage["error"] = current_stage.get("error", "") + suffix
+            stages[current_idx] = current_stage
+            state["staged_exploit"]["stages"] = stages
 
     return state
 

@@ -2,9 +2,9 @@
 Feedback Agent - Evaluates progress and provides feedback.
 
 Responsibilities:
-- Code-based readiness score computation (deterministic)
-- LLM for qualitative feedback (what to do next)
+- Code-based readiness score computation (deterministic, no LLM)
 - Decide whether to loop or go to Exploit
+- Build deterministic feedback_to_plan from analysis state
 """
 
 import time
@@ -13,8 +13,7 @@ from typing import Any, Dict, List, Optional
 from rich.console import Console
 from rich.panel import Panel
 
-from Agent.base import BaseAgent, parse_json_response
-from Templates.prompt import build_messages
+from Agent.base import BaseAgent
 from LangGraph.state import compute_readiness
 
 console = Console()
@@ -45,10 +44,8 @@ class FeedbackAgent(BaseAgent):
         self.readiness_threshold = readiness_threshold
 
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Run Feedback Agent."""
+        """Run Feedback Agent — code-based score only (no LLM call)."""
         console.print(Panel("Feedback Agent", style="bold green"))
-
-        self.clear_history()
 
         # --- Step 1: Code-based readiness score ---
         analysis = state.get("analysis", {})
@@ -61,115 +58,70 @@ class FeedbackAgent(BaseAgent):
         if missing:
             console.print(f"[yellow]  Missing: {', '.join(missing)}[/yellow]")
 
-        # --- Step 2: LLM for qualitative feedback ---
-        parsing_output = state.get("parsing_output", {})
-        key_findings = parsing_output.get("json", {}).get("key_findings", [])
-
-        tasks = state.get("tasks", [])
-        completed_tasks = [
-            {"id": t["id"], "title": t.get("title", ""), "success": True}
-            for t in tasks if t.get("status") == "done"
-        ][-5:]
-
-        messages = build_messages(
-            agent="feedback",
-            state=state,
-            include_initial=False,
-            completed_tasks=completed_tasks,
-            key_findings=key_findings,
-        )
-
-        if messages:
-            self.set_system_prompt(messages[0]["content"])
-            for msg in messages[1:]:
-                if msg["role"] == "user":
-                    self.add_user_message(msg["content"])
-
-        console.print("[cyan]Calling LLM for qualitative feedback...[/cyan]")
-        response_text = self.call_llm()
-
-        parsed = parse_json_response(response_text)
-
-        state["feedback_output"] = {
-            "agent": "feedback",
-            "text": response_text,
-            "json": parsed,
-            "created_at": time.time(),
-        }
-
-        # --- Step 3: Use CODE score, not LLM score ---
-        readiness_score = code_score  # Override LLM score
-
-        # LLM can suggest exploit but we gate on code score
-        llm_recommend = parsed.get("recommend_exploit", False)
-        llm_loop = parsed.get("loop_continue", True)
-
-        # #4: 취약점 타입별 동적 threshold
+        # --- Step 2: Threshold check ---
         effective_threshold = self._compute_dynamic_threshold(analysis)
-        console.print(f"[cyan]Dynamic Threshold: {effective_threshold:.2f} (base: {self.readiness_threshold})[/cyan]")
-
-        # Recommend exploit if code score meets threshold
-        recommend_exploit = readiness_score >= effective_threshold
-        # Also allow if LLM recommends and score is close
-        if llm_recommend and readiness_score >= (effective_threshold - 0.15):
-            recommend_exploit = True
+        recommend_exploit = code_score >= effective_threshold
 
         state["exploit_readiness"] = {
-            "score": readiness_score,
+            "score": code_score,
             "components": completed,
             "missing": missing,
             "recommend_exploit": recommend_exploit,
         }
-
-        # Update analysis readiness score
         if "analysis" in state:
-            state["analysis"]["readiness_score"] = readiness_score
+            state["analysis"]["readiness_score"] = code_score
 
-        # Show feedback
-        console.print(f"[cyan]Final Readiness Score: {readiness_score:.0%} (code-based)[/cyan]")
-        console.print(f"[cyan]Recommend Exploit: {recommend_exploit}[/cyan]")
+        console.print(f"[cyan]Threshold: {effective_threshold:.2f} → Recommend Exploit: {recommend_exploit}[/cyan]")
 
-        if "feedback_to_plan" in parsed:
-            console.print(Panel(
-                parsed["feedback_to_plan"],
-                title="Feedback to Plan",
-                border_style="yellow"
-            ))
+        # --- Step 3: Build deterministic feedback_to_plan ---
+        feedback_parts = []
+
+        if missing:
+            feedback_parts.append(f"Still missing: {', '.join(missing)}. Focus on resolving these.")
+
+        # Exploit failure context → guide Plan to re-analyze
+        failure_ctx = state.get("exploit_failure_context", {})
+        if failure_ctx:
+            stage_id = failure_ctx.get("stage_id", "unknown")
+            error = failure_ctx.get("error", "")[:400]
+            code_snippet = failure_ctx.get("code", "")[:600]
+            feedback_parts.append(
+                f"[EXPLOIT FAILURE] Stage '{stage_id}' failed after {failure_ctx.get('attempts', '?')} attempts.\n"
+                f"Error: {error}\n"
+                f"Failing code:\n```python\n{code_snippet}\n```\n"
+                f"→ Re-analyze offsets, I/O pattern, and leak values. "
+                f"If PIE leak returns 0x0 or an ASCII-like value, the pattern_len / offset is wrong."
+            )
+
+        # Key analysis hints for Plan
+        dv = analysis.get("dynamic_verification", {})
+        if dv.get("buf_offset_to_canary"):
+            feedback_parts.append(
+                f"Verified offsets: buf_offset_to_canary={dv.get('buf_offset_to_canary')}, "
+                f"buf_offset_to_ret={dv.get('buf_offset_to_ret')}."
+            )
+
+        feedback_to_plan = "\n\n".join(feedback_parts) if feedback_parts else (
+            "Analysis looks complete. Proceed with exploit generation."
+        )
+
+        parsed = {"feedback_to_plan": feedback_to_plan, "recommend_exploit": recommend_exploit}
+        state["feedback_output"] = {
+            "agent": "feedback",
+            "text": feedback_to_plan,
+            "json": parsed,
+            "created_at": time.time(),
+        }
+
+        console.print(Panel(feedback_to_plan, title="Feedback to Plan", border_style="yellow"))
 
         # --- Step 4: Decision ---
-        iteration_count = state.get("iteration_count", 0)
-
         if recommend_exploit:
             console.print("[green]Ready for exploitation![/green]")
             state["loop"] = False
         else:
-            # Always continue until max iterations or exploit ready
-            feedback_additions = []
-
             if missing:
                 console.print(f"[yellow]  Still missing: {', '.join(missing)} — continuing[/yellow]")
-                feedback_additions.append(f"[AUTO] Focus on resolving missing items: {', '.join(missing)}")
-
-            # #3: 실패한 익스 정보를 Plan에 피드백
-            failure_ctx = state.get("exploit_failure_context", {})
-            if failure_ctx:
-                stage_id = failure_ctx.get("stage_id", "unknown")
-                error = failure_ctx.get("error", "")[:300]
-                code_snippet = failure_ctx.get("code", "")[:500]
-                feedback_additions.append(
-                    f"\n[EXPLOIT FAILURE] Stage '{stage_id}' failed after {failure_ctx.get('attempts', '?')} attempts.\n"
-                    f"Error: {error}\n"
-                    f"Failing code snippet:\n```python\n{code_snippet}\n```\n"
-                    f"→ Re-analyze: check offsets, I/O interaction pattern, leak values. "
-                    f"If leak returns 0x0, the leak offset is wrong."
-                )
-
-            if feedback_additions:
-                if "feedback_to_plan" not in parsed or not parsed["feedback_to_plan"]:
-                    parsed["feedback_to_plan"] = ""
-                parsed["feedback_to_plan"] += "\n\n" + "\n\n".join(feedback_additions)
-                state["feedback_output"]["json"] = parsed
-
             state["loop"] = True
 
         return state

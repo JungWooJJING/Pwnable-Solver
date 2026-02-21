@@ -352,17 +352,34 @@ def run_solver(state: SolverState, ask_interval: int = 5) -> SolverState:
     return final_state or state
 
 
-def setup_docker_env(binary_path: str, port: int = 1337) -> bool:
-    """Setup Docker environment for exploit testing"""
+def setup_docker_env(binary_path: str, port: int = 1337, analysis: bool = True) -> bool:
+    """Setup Docker environment for exploit testing (+ optional analysis container with pwndbg)"""
     from Tool.tool import Tool
 
     console.print(Panel("Setting up Docker Environment", style="bold blue"))
 
     try:
         tool = Tool(binary_path=binary_path)
+
+        # 챌린지 컨테이너 (서비스용)
         result = tool.Docker_setup(port=port)
         console.print(result)
-        return "[SUCCESS]" in result
+        if "[SUCCESS]" not in result:
+            return False
+
+        # 분석 컨테이너 (pwndbg 포함 — 챌린지 이미지 기반)
+        if analysis:
+            console.print(Panel("Setting up Analysis Container (pwndbg)", style="bold blue"))
+            analysis_result = tool.Docker_setup_analysis()
+            if "[SUCCESS]" not in analysis_result:
+                console.print(
+                    f"[yellow]Warning: Analysis container setup failed "
+                    f"(Pwndbg will fall back to host):\n{analysis_result}[/yellow]"
+                )
+            else:
+                console.print("[green]Analysis container ready — Pwndbg will use Docker[/green]")
+
+        return True
     except Exception as e:
         console.print(f"[red]Docker setup failed: {e}[/red]")
         return False
@@ -377,6 +394,8 @@ def main():
     parser.add_argument("--flag-format", "-f", help="Flag format", default="FLAG{...}")
     parser.add_argument("--docker", action="store_true", help="Auto-setup Docker environment for testing")
     parser.add_argument("--docker-port", type=int, default=1337, help="Docker port (default: 1337)")
+    parser.add_argument("--no-analysis-docker", action="store_true",
+                        help="Skip analysis container (pwndbg will run on host)")
     parser.add_argument("--ask-interval", type=int, default=5, help="Ask to continue every N iterations (0=never)")
     parser.add_argument("--max-attempts", type=int, default=3, help="Max exploit verification attempts (default: 3)")
     parser.add_argument("--auto", action="store_true", help="Fully automatic mode (no user prompts during solving)")
@@ -417,7 +436,8 @@ def main():
 
     # Setup Docker if requested
     if args.docker and binary_path:
-        if not setup_docker_env(binary_path, args.docker_port):
+        use_analysis = not args.no_analysis_docker
+        if not setup_docker_env(binary_path, args.docker_port, analysis=use_analysis):
             console.print("[yellow]Warning: Docker setup failed, continuing without Docker[/yellow]")
         else:
             console.print(f"[green]Docker environment ready on port {args.docker_port}[/green]")

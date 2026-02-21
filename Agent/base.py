@@ -64,6 +64,7 @@ MODEL_PRICING = {
     "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
     # Gemini
     "gemini-3-flash-preview": {"input": 0.15, "cached_input": 0.0375, "output": 0.60},
+    "gemini-2.5-flash-preview": {"input": 0.15, "cached_input": 0.0375, "output": 0.60},
     "gemini-2.5-flash": {"input": 0.15, "cached_input": 0.0375, "output": 0.60},
     "gemini-2.0-flash": {"input": 0.10, "cached_input": 0.025, "output": 0.40},
     "gemini-1.5-pro": {"input": 1.25, "cached_input": 0.3125, "output": 5.00},
@@ -75,6 +76,7 @@ MODEL_CONTEXT_LIMITS = {
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
     "gemini-3-flash-preview": 1_000_000,
+    "gemini-2.5-flash-preview": 1_000_000,
     "gemini-2.5-flash": 1_000_000,
     "gemini-2.0-flash": 1_000_000,
     "gemini-1.5-pro": 2_000_000,
@@ -328,82 +330,82 @@ class OpenAIClient(LLMClient):
 
 
 class GeminiClient(LLMClient):
-    """Google Gemini API client."""
-    
+    """Google Gemini API client (google.genai SDK)."""
+
     def __init__(self):
         try:
-            import google.generativeai as genai  # type: ignore[import-not-found]
+            from google import genai  # type: ignore[import-not-found]
+            from google.genai import types  # type: ignore[import-not-found]
             api_key = os.environ.get("GEMINI_API_KEY")
             if not api_key:
                 raise RuntimeError("GEMINI_API_KEY not set")
-            genai.configure(api_key=api_key)
-            self.genai = genai
+            self.client = genai.Client(api_key=api_key)
+            self.types = types
         except ImportError:
-            raise RuntimeError("google-generativeai package not installed. Run: pip install google-generativeai")
-    
+            raise RuntimeError("google-genai package not installed. Run: pip install google-genai")
+
     def chat(
         self,
         messages: List[Dict[str, str]],
-        model: str = "gemini-3-flash-preview",
+        model: str = "gemini-2.0-flash",
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
     ) -> Tuple[str, Dict[str, int]]:
-        # Convert messages to Gemini format
-        gemini_model = self.genai.GenerativeModel(model)
-        
-        # Combine system + user messages
+        # Separate system instruction from conversation history
         system_msg = ""
-        conversation = []
-        
+        history = []
+
         for msg in messages:
             role = msg["role"]
             content = msg["content"]
-            
+
             if role == "system":
                 system_msg = content
             elif role == "user":
-                conversation.append({"role": "user", "parts": [content]})
+                history.append({"role": "user", "parts": [{"text": content}]})
             elif role == "assistant":
-                conversation.append({"role": "model", "parts": [content]})
-        
-        # Prepend system message to first user message
-        if system_msg and conversation:
-            first_content = conversation[0]["parts"][0]
-            conversation[0]["parts"][0] = f"{system_msg}\n\n---\n\n{first_content}"
-        
-        # Generation config
-        generation_config = {
-            "temperature": temperature,
-        }
+                history.append({"role": "model", "parts": [{"text": content}]})
+
+        # Pop the last user message to send via chat.send_message()
+        last_msg = ""
+        if history and history[-1]["role"] == "user":
+            last_msg = history[-1]["parts"][0]["text"]
+            history = history[:-1]
+
+        # Build GenerateContentConfig
+        config_kwargs: Dict[str, Any] = {"temperature": temperature}
         if max_tokens:
-            generation_config["max_output_tokens"] = max_tokens
-        
-        # Send request
-        chat = gemini_model.start_chat(history=conversation[:-1] if len(conversation) > 1 else [])
-        response = chat.send_message(
-            conversation[-1]["parts"][0] if conversation else "",
-            generation_config=generation_config,
+            config_kwargs["max_output_tokens"] = max_tokens
+        if system_msg:
+            config_kwargs["system_instruction"] = system_msg
+        config = self.types.GenerateContentConfig(**config_kwargs)
+
+        # Create stateful chat session and send the last message
+        chat_session = self.client.chats.create(
+            model=model,
+            config=config,
+            history=history,
         )
-        
+        response = chat_session.send_message(last_msg)
+
         content = response.text or ""
-        
-        # Estimate tokens (Gemini doesn't always return usage)
-        usage = {
-            "input_tokens": sum(len(m["parts"][0]) // 4 for m in conversation),
+
+        # Token usage — fall back to character-based estimate
+        usage: Dict[str, int] = {
+            "input_tokens": sum(len(str(m)) // 4 for m in messages),
             "output_tokens": len(content) // 4,
             "cached_tokens": 0,
         }
-        
-        # Try to get actual usage if available
-        if hasattr(response, "usage_metadata"):
+
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
             meta = response.usage_metadata
-            if hasattr(meta, "prompt_token_count"):
+            if getattr(meta, "prompt_token_count", None):
                 usage["input_tokens"] = meta.prompt_token_count
-            if hasattr(meta, "candidates_token_count"):
+            if getattr(meta, "candidates_token_count", None):
                 usage["output_tokens"] = meta.candidates_token_count
-            if hasattr(meta, "cached_content_token_count"):
+            if getattr(meta, "cached_content_token_count", None):
                 usage["cached_tokens"] = meta.cached_content_token_count or 0
-        
+
         return content, usage
 
 
@@ -770,6 +772,29 @@ def is_response_truncated(text: str) -> bool:
         return True
 
     return False
+
+
+def validate_python_code(code: str) -> tuple:
+    """
+    Python 코드 문법을 compile()로 검증.
+
+    Returns:
+        (is_valid: bool, error_msg: str)
+        - is_valid: 문법이 올바르면 True
+        - error_msg: 오류 메시지 (정상이면 빈 문자열)
+    """
+    if not code or not code.strip():
+        return False, "Empty code"
+
+    try:
+        compile(code, '<exploit>', 'exec')
+        return True, ""
+    except SyntaxError as e:
+        line_info = f" at line {e.lineno}" if e.lineno else ""
+        text_info = f": '{e.text.strip()}'" if e.text else ""
+        return False, f"SyntaxError{line_info} — {e.msg}{text_info}"
+    except Exception as e:
+        return False, str(e)
 
 
 def parse_json_response(text: str) -> Dict[str, Any]:
