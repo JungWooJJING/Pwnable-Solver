@@ -109,6 +109,24 @@ class InstructionAgent(BaseAgent):
             else:
                 parallel_cmds.append(cmd)
 
+        # 모든 명령이 중복으로 스킵된 경우: Run fallback 1회만 실행 (seen_hashes 체크로 무한 루프 방지)
+        if not parallel_cmds and not sequential_cmds and commands and binary_path:
+            fallback_cmd = {
+                "tool": "Run",
+                "args": {"cmd": f"nm {binary_path} 2>/dev/null | grep -E ' arr$| win$| main$'; readelf -r {binary_path} 2>/dev/null | head -40"},
+                "purpose": "fallback_offset_symbols",
+            }
+            fallback_hash = compute_cmd_hash(fallback_cmd["tool"], fallback_cmd["args"])
+            if fallback_hash not in seen_hashes:
+                analysis = state.get("analysis", {})
+                dv = analysis.get("dynamic_verification", {})
+                need_offset = dv.get("buf_offset_to_canary") is None and dv.get("buf_offset_to_ret") is None
+                need_symbols = analysis.get("win_function") and not analysis.get("win_function_addr")
+                if need_offset or need_symbols:
+                    seen_hashes.append(fallback_hash)
+                    console.print("[yellow]All commands were duplicates — running fallback Run once for offset/symbols[/yellow]")
+                    parallel_cmds = [fallback_cmd]
+
         # Execute parallelizable tools concurrently
         if parallel_cmds:
             console.print(f"[cyan]Executing {len(parallel_cmds)} tools in parallel...[/cyan]")

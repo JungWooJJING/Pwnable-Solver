@@ -1420,7 +1420,7 @@ def Stage_verify_node(
         # Opportunistic crash analysis
         _crash_info = _analyze_core_if_exists(binary_path, _core_search_dirs, _run_start)
         if _crash_info:
-            current_stage["error"] += _crash_info
+            current_stage["error"] += "\n\n=== CORE DUMP ANALYSIS ===\n" + _crash_info
         stages[current_idx] = current_stage
         state["staged_exploit"]["stages"] = stages
         return state
@@ -1432,7 +1432,7 @@ def Stage_verify_node(
         # Opportunistic crash analysis
         _crash_info = _analyze_core_if_exists(binary_path, _core_search_dirs, _run_start)
         if _crash_info:
-            current_stage["error"] += _crash_info
+            current_stage["error"] += "\n\n=== CORE DUMP ANALYSIS ===\n" + _crash_info
         stages[current_idx] = current_stage
         state["staged_exploit"]["stages"] = stages
         return state
@@ -1481,7 +1481,10 @@ def Stage_verify_node(
         else:
             console.print(f"[red]Stage {current_idx+1} FAILED (no shell)[/red]")
             current_stage["verified"] = False
-            current_stage["error"] = combined
+            current_stage["error"] = (
+                "=== SHELL_FAILED (no shell obtained — check exploit flow) ===\n"
+                + combined
+            )
     else:
         # Intermediate stage: check for marker string
         # Also check for explicit STAGE_FAILED marker (code validated and found invalid result)
@@ -1698,7 +1701,7 @@ def Stage_verify_node(
         if _pie_warn:
             suffix += _pie_warn
         if _crash_info:
-            suffix += _crash_info
+            suffix += "\n\n=== CORE DUMP ANALYSIS ===\n" + _crash_info
         if suffix:
             current_stage["error"] = current_stage.get("error", "") + suffix
             stages[current_idx] = current_stage

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
+import re
 import time
+from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
 
 AgentName = Literal["plan", "instruction", "parsing", "feedback", "exploit"]
 
@@ -232,6 +233,8 @@ class SolverState(TypedDict, total=False):
     # --- 루프 제어 ---
     iteration_count: int
     workflow_step_count: int
+    recon_done: bool                    # Phase 1 RECON 완료 여부 (중복 실행 방지)
+    gdb_forced_count: int               # GDB 강제 실행 횟수 (stage_identify 전이용)
 
     # --- 성공 판정 ---
     exploit_readiness: Dict[str, Any]   # {score:0~1, components:{...}, recommend_exploit: bool}
@@ -328,6 +331,8 @@ def init_state(**overrides: Any) -> SolverState:
 
         "iteration_count": 0,
         "workflow_step_count": 0,
+        "recon_done": False,
+        "gdb_forced_count": 0,
 
         "exploit_readiness": {"score": 0.0, "components": {}, "recommend_exploit": False},
         "flag_detected": False,
@@ -672,14 +677,121 @@ def merge_analysis_updates(state: SolverState, updates: Dict[str, Any]) -> None:
 
     # Dynamic verification (LLM-extracted from Pwndbg output — deep merge)
     if "dynamic_verification" in updates:
+        dv_upd = updates["dynamic_verification"]
         dv = analysis.setdefault("dynamic_verification", {"verified": False, "local_vars": [], "raw_gdb_output": ""})
-        dv.update(updates["dynamic_verification"])
+        if isinstance(dv_upd, dict):
+            dv.update(dv_upd)
+        else:
+            # LLM이 문자열/리스트 등 잘못된 타입 반환 시 방어 (ValueError 방지)
+            if isinstance(dv_upd, (list, tuple)):
+                pass  # 무시
+            else:
+                dv["raw_gdb_output"] = str(dv_upd)
 
     # Last exploit failure (overwrite)
     if "last_exploit_failure" in updates:
         analysis["last_exploit_failure"] = updates["last_exploit_failure"]
 
+    # OOB+GOT info (generic: pie_leak_index, pie_leak_offset, got_targets)
+    if "oob_got_info" in updates:
+        oob = updates["oob_got_info"]
+        if isinstance(oob, dict):
+            analysis["oob_got_info"] = oob
+
     state["analysis"] = analysis
+
+
+def prune_blockers(blockers: List[Dict[str, Any]], analysis: Analysis) -> List[Dict[str, Any]]:
+    """
+    해결된 블로커 제거, 중복 정리, 최대 개수 제한.
+    Plan 전 또는 Feedback 후 호출.
+    """
+    MAX_BLOCKERS = 25
+    vulns = analysis.get("vulnerabilities", [])
+    has_offset = any(v.get("estimated_offset") or v.get("buffer_size") or v.get("offset") for v in vulns)
+    has_leak = analysis.get("leak_primitive", False)
+
+    def is_resolved(b: Dict[str, Any]) -> bool:
+        if b.get("resolved"):
+            return True
+        q = (b.get("question") or "").lower()
+        if has_offset and ("offset" in q or "arr" in q or "got" in q or "index" in q or "address" in q):
+            return True
+        if has_leak and ("leak" in q or "pie" in q or "base" in q):
+            return True
+        return False
+
+    pruned = [b for b in blockers if not is_resolved(b)]
+    # severity 높은 순 유지, 최대 MAX_BLOCKERS
+    pruned.sort(key=lambda x: -(x.get("severity", 0) or 0))
+    return pruned[:MAX_BLOCKERS]
+
+
+def infer_readiness_from_key_findings(analysis: Analysis, key_findings: List[str]) -> None:
+    """
+    key_findings 텍스트에서 offset/leak 정보를 추론해 analysis에 반영.
+    Parsing 후 readiness 점수 향상을 위해 호출.
+    """
+    if not key_findings:
+        return
+    text = " ".join(str(f) for f in key_findings).lower()
+
+    # offset_or_detail_known: hex offset, index -N, arr[-N] 패턴
+    has_offset_hint = any(
+        [
+            "0x" in text and ("offset" in text or "arr" in text or "got" in text),
+            "index -" in text or "index -" in text.replace(" ", ""),
+            "arr[-" in text or "arr[" in text and "-" in text,
+        ]
+    )
+    vulns = analysis.get("vulnerabilities", [])
+    if has_offset_hint and vulns:
+        for v in vulns:
+            if not (v.get("estimated_offset") or v.get("buffer_size") or v.get("offset")):
+                v["estimated_offset"] = 1  # placeholder: offset 정보 존재함을 표시
+                break
+
+    # leak_primitive: PIE leak, OOB read, arr[- 등
+    leak_hint = any(
+        [
+            "leak" in text and ("pie" in text or "base" in text or "got" in text),
+            "arr[-" in text or ("arr[" in text and "-" in text),
+            "index -" in text,
+            "self-pointer" in text or "self pointer" in text,
+            "oob read" in text or "oob" in text and "read" in text,
+        ]
+    )
+    if leak_hint and analysis.get("win_function"):
+        analysis["leak_primitive"] = True
+
+    # OOB+GOT: parse pie_leak_index, pie_leak_offset, got_targets from key_findings
+    oob_got_hint = any(
+        [
+            "got" in text and ("index" in text or "arr" in text or "oob" in text),
+            "index -" in text and ("puts" in text or "printf" in text or "got" in text),
+            "arr[-" in text or ("arr[" in text and "-" in text and "got" in text),
+        ]
+    )
+    if oob_got_hint and not analysis.get("oob_got_info"):
+        oob: Dict[str, Any] = {}
+        # pie_leak_index: "index -N", "arr[-N]"
+        for m in re.finditer(r"(?:index|arr\[)\s*(-\d+)", text, re.I):
+            oob["pie_leak_index"] = int(m.group(1))
+            break
+        # pie_leak_offset: hex offset near "offset"/"base"/"leak"
+        off_m = re.search(r"(?:offset|at|from base)\s*(0x[0-9a-f]{3,6})\b|(0x[0-9a-f]{3,6})\b.*?(?:offset|base|leak)", text, re.I)
+        if off_m:
+            oob["pie_leak_offset"] = (off_m.group(1) or off_m.group(2) or "").lower()
+        # got_targets: "func is at index -N", "func at -N", "index -N (func)"
+        got_targets: Dict[str, int] = {}
+        for m in re.finditer(r"(puts|printf|scanf|setvbuf|exit)\s+(?:is\s+)?(?:at\s+)?(?:index\s+)?(-?\d+)", text, re.I):
+            got_targets[m.group(1).lower()] = int(m.group(2))
+        for m in re.finditer(r"index\s+(-?\d+)[^)]*\((puts|printf|scanf|setvbuf)\)", text, re.I):
+            got_targets[m.group(2).lower()] = int(m.group(1))
+        if got_targets:
+            oob["got_targets"] = got_targets
+        if oob:
+            analysis["oob_got_info"] = oob
 
 
 # =========================

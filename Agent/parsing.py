@@ -17,7 +17,7 @@ from rich.panel import Panel
 
 from Agent.base import BaseAgent, parse_json_response
 from Templates.prompt import build_messages
-from LangGraph.state import mark_task_status, merge_analysis_updates
+from LangGraph.state import mark_task_status, merge_analysis_updates, infer_readiness_from_key_findings
 
 console = Console()
 
@@ -306,6 +306,12 @@ class ParsingAgent(BaseAgent):
             all_key_findings.extend(llm_findings)
         else:
             console.print("[dim]All outputs parsed deterministically, no LLM call needed[/dim]")
+
+        # Infer offset/leak from key_findings for readiness (LLM이 구조화하지 않은 경우 대비)
+        analysis = state.get("analysis", {})
+        if all_key_findings:
+            infer_readiness_from_key_findings(analysis, all_key_findings)
+            state["analysis"] = analysis
 
         # --- Store results ---
         state["parsing_output"] = {

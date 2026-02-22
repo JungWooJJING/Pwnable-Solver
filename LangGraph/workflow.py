@@ -118,12 +118,28 @@ def route_after_feedback(state: SolverState) -> Literal["plan", "stage_identify"
         has_pie = "pie enabled" in result_str and "no pie" not in result_str
 
         dv = analysis.get("dynamic_verification", {})
-        # Require verified flag AND actual numeric offset values populated by GDB
-        dv_complete = (
-            dv.get("verified") is True
-            and isinstance(dv.get("buf_offset_to_canary"), int)
-            and isinstance(dv.get("buf_offset_to_ret"), int)
+        vulns = analysis.get("vulnerabilities", [])
+        vuln_types = {v.get("type", "").lower() for v in vulns}
+        strategy_lower = str(analysis.get("strategy", "")).lower()
+        # OOB, format_string 등은 스택 오버플로우가 아님 → buf_offset 불필요
+        non_stack = ("out_of_bounds", "oob", "format_string", "fmt", "use_after_free", "uaf")
+        has_non_stack = (
+            any(t in non_stack for t in vuln_types)
+            or "oob" in strategy_lower or "got overwrite" in strategy_lower or "ret2win" in strategy_lower
         )
+        needs_stack_offsets = (
+            any(t in ("buffer_overflow", "bof", "stack_overflow") for t in vuln_types)
+            and not has_non_stack
+        )
+        if needs_stack_offsets:
+            dv_complete = (
+                dv.get("verified") is True
+                and isinstance(dv.get("buf_offset_to_canary"), int)
+                and isinstance(dv.get("buf_offset_to_ret"), int)
+            )
+        else:
+            # 비-스택오버플로우: verified만 있으면 충분
+            dv_complete = dv.get("verified") is True
 
         # If we came back from a failed stage exploit, don't block on dv again —
         # the LLM already understands the offsets from static/source analysis.

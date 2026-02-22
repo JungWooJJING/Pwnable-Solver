@@ -1070,6 +1070,23 @@ Use this function as the exploit target — **no libc leak needed**.
 [NOT YET — will be populated by Phase 1 RECON]
 {% endif %}
 
+{% if analysis.oob_got_info %}
+## OOB + GOT Layout (use these values directly)
+| Field | Value |
+|-------|-------|
+{% if analysis.oob_got_info.pie_leak_index is defined %}
+| PIE leak index | arr[{{ analysis.oob_got_info.pie_leak_index }}] |
+{% endif %}
+{% if analysis.oob_got_info.pie_leak_offset is defined %}
+| PIE base | code_base = leaked - {{ analysis.oob_got_info.pie_leak_offset }} |
+{% endif %}
+{% if analysis.oob_got_info.got_targets %}
+{% for name, idx in analysis.oob_got_info.got_targets.items() %}
+| GOT {{ name }} | arr[{{ idx }}] |
+{% endfor %}
+{% endif %}
+{% endif %}
+
 ---
 
 ## Exploit Readiness
@@ -1790,8 +1807,8 @@ When you see decompiled code with `printf`/`puts`/`write` for output and `scanf`
 {
   "analysis_updates": {
     "io_patterns": [
-      {"prompt": "Pattern: ", "input_method": "read", "format": "", "max_len": 80},
-      {"prompt": "Target length: ", "input_method": "scanf", "format": "%d"}
+      {"prompt": "<exact from decompile>", "input_method": "read", "format": "", "max_len": 0},
+      {"prompt": "<exact from decompile>", "input_method": "scanf", "format": "%d"}
     ]
   }
 }
@@ -1809,8 +1826,7 @@ If the overflow mechanism has restrictions, record them in the vulnerability ent
     {
       "type": "buffer_overflow",
       "exploit_constraints": [
-        "target_len must be <= 1000 (binary checks and breaks if larger)",
-        "pattern length must be <= 80 (read limit)"
+        "extract limits from source (e.g. if (len > N) break)"
       ],
       "exploit_mechanism": "describe how overflow actually works (standard, loop overshoot, etc.)"
     }
@@ -1875,6 +1891,26 @@ When parsing Pwndbg/GDB output that includes stack inspection (`x/40gx $rsp`, `p
   the libc startup code (e.g., the address of main passed to __libc_start_main).
 
 **IMPORTANT: Always set `verified: true` when you successfully extract these values.**
+
+---
+
+## OOB + GOT Layout (extract when nm/readelf/GDB shows OOB array + GOT)
+
+When parsing output that mentions OOB array access and GOT overwrite (arr with negative indices, GOT entries reachable via OOB), extract from the actual output:
+```json
+{
+  "analysis_updates": {
+    "oob_got_info": {
+      "pie_leak_index": <arr index holding a PIE-relative pointer, compute from nm/readelf/vmmap>,
+      "pie_leak_offset": "<hex offset of that pointer from code base>",
+      "got_targets": {"<func>": <arr_index>, ...}
+    }
+  }
+}
+```
+- `pie_leak_index`: arr index that holds a pointer into the binary (PIE leak). Compute from memory layout / vmmap.
+- `pie_leak_offset`: that pointer's offset from code base → `code_base = leaked - pie_leak_offset`
+- `got_targets`: from GOT layout, map each overwritable function to its arr index: `{ function_name: arr_index }`
 
 ---
 
@@ -3226,6 +3262,49 @@ p.send(payload)
 **If `verified: false` or section says "NOT YET DONE":** use static estimates from decompile only
 as a starting point — but request dynamic verification via Pwndbg before finalizing.
 
+{% if confirmed and (confirmed.win_offset or confirmed.symbols or confirmed.oob_got_info) %}
+## Confirmed Values from Analysis (USE DIRECTLY — do not guess)
+
+| Item | Value |
+|------|-------|
+{% if confirmed.win_offset %}
+| win function offset | {{ confirmed.win_offset }} |
+{% endif %}
+{% if confirmed.oob_got_info %}
+{% if confirmed.oob_got_info.pie_leak_index is defined %}
+| PIE leak index | arr[{{ confirmed.oob_got_info.pie_leak_index }}] |
+{% endif %}
+{% if confirmed.oob_got_info.pie_leak_offset is defined %}
+| PIE base formula | code_base = leaked_value - {{ confirmed.oob_got_info.pie_leak_offset }} |
+{% endif %}
+{% if confirmed.oob_got_info.got_targets %}
+{% for name, idx in confirmed.oob_got_info.got_targets.items() %}
+| GOT {{ name }} | arr[{{ idx }}] |
+{% endfor %}
+{% endif %}
+{% endif %}
+{% if confirmed.symbols %}
+{% for name, addr in confirmed.symbols.items() %}
+| {{ name }} | {{ addr }} |
+{% endfor %}
+{% endif %}
+{% if confirmed.offset is defined %}
+| estimated_offset | {{ confirmed.offset }} |
+{% endif %}
+{% if confirmed.buffer_size is defined %}
+| buffer_size | {{ confirmed.buffer_size }} |
+{% endif %}
+{% endif %}
+{% if has_hook_overwrite %}
+## Hook/GOT Overwrite — Trigger Flow
+
+When overwriting a function pointer (GOT entry, vtable, hook), the overwritten function is called on the **next** invocation by normal control flow.
+- After overwriting GOT, the binary typically waits for input (e.g. menu option).
+- Send the expected input (e.g. menu choice `1` or `2`) so the loop advances.
+- The next menu/prompt cycle will call the overwritten function → payload executes.
+- Do NOT send shell verification command (e.g. `id`) as the first input — send menu option first, then verify.
+{% endif %}
+
 ---
 
 ## CRITICAL Rules
@@ -3558,6 +3637,10 @@ The following helper functions are generated from the decompiled binary.
 ```
 {% endif %}
 
+{% if has_hook_overwrite %}
+**Hook/GOT overwrite:** The payload runs on the next call to the overwritten function — trace control flow to see when that happens.
+{% endif %}
+
 {% if additions_only %}
 Generate the **Stage {{ current_stage.stage_index + 1 }} additions** for: {{ current_stage.stage_id }}.
 Description: {{ current_stage.description }}
@@ -3702,10 +3785,8 @@ Focus on:
   - `fgets(inp, n, stdin)` or `scanf("%s", inp)` → Case A (stdio, +1 from '\n')
 
 **SHELL_FAILED / no shell with 'STAGE1_OK' printed:**
-- Check the pwntools debug output `[DEBUG] Sent N bytes:` for the exploit payload.
-  Look at the last 8 bytes (return address slot) in the hex dump (the `│···│` ASCII column).
-  If those bytes spell readable text (like `│prte│rn··│`), the win_addr computation is wrong.
-  The pie_base used for win_addr was computed from garbage (prompt text), not a real binary address.
+- **GOT/Hook overwrite trigger**: After overwriting GOT, the binary waits for menu input. Do NOT send shell verify command first — send the menu option so the loop advances and the overwritten function is called. Only then send verify command (e.g. `id`).
+- **Wrong pie_base**: Check `[DEBUG] Sent N bytes:` — if the last 8 bytes spell readable text, win_addr is wrong. Use `code_base = leaked - pie_leak_offset` from Analysis Document (oob_got_info), not a guessed offset.
 
 **I/O RULES (most common failure cause):**
 - Each `scanf()` call needs its own `p.sendlineafter(prompt, value)`
@@ -3742,9 +3823,9 @@ STAGE_REFINE_USER = env.from_string("""## Failing Stage: {{ stage.stage_id }} (S
 {{ stage.code }}
 ```
 
-## Error Output
+## Error Output (includes SHELL_FAILED output and CORE DUMP ANALYSIS when applicable)
 ```
-{{ error_output[:5000] }}
+{{ error_output[:8000] }}
 ```
 
 {% if stage.last_hex_dump %}
@@ -3904,6 +3985,41 @@ def _generate_io_helper_code(state: SolverState) -> str:
     return "\n\n".join(helpers) if helpers else ""
 
 
+def _extract_confirmed_analysis_values(state: SolverState) -> Dict[str, Any]:
+    """
+    Extract confirmed offsets/symbols from analysis and facts for exploit generation.
+    Generic: works for any challenge type (stack overflow, heap, OOB, GOT, etc.).
+    """
+    analysis = state.get("analysis", {})
+    facts = state.get("facts", {})
+    func_syms = facts.get("function_symbols", {})
+    result: Dict[str, Any] = {}
+
+    # Win/backdoor function (any challenge may have one)
+    win_name = analysis.get("win_function_name") or "win"
+    win_addr = analysis.get("win_function_addr") or func_syms.get(win_name, "")
+    if win_addr:
+        result["win_offset"] = win_addr if isinstance(win_addr, str) else f"0x{win_addr:x}"
+
+    # All known symbols — use for GOT, BSS, any target (no hardcoded names)
+    if func_syms:
+        result["symbols"] = dict(func_syms)
+
+    # OOB+GOT info (from parsing / infer_readiness_from_key_findings)
+    oob = analysis.get("oob_got_info", {})
+    if isinstance(oob, dict) and oob:
+        result["oob_got_info"] = oob
+
+    # Vuln-specific values (offset, buffer_size — from any vuln type)
+    for v in analysis.get("vulnerabilities", []):
+        if v.get("estimated_offset") and "offset" not in result:
+            result["offset"] = v["estimated_offset"]
+        if v.get("buffer_size"):
+            result.setdefault("buffer_size", v["buffer_size"])
+
+    return result
+
+
 def build_stage_exploit_messages(
     state: SolverState,
     current_stage: Dict[str, Any],
@@ -3914,6 +4030,13 @@ def build_stage_exploit_messages(
     """Build prompt messages for stage exploit generation."""
     analysis = state.get("analysis", {})
     staged = state.get("staged_exploit", {})
+    confirmed = _extract_confirmed_analysis_values(state)
+
+    # Hook/GOT overwrite: generic trigger-flow hint (any vuln that overwrites function pointers)
+    vuln_types = [str(v.get("type", "")).lower() for v in analysis.get("vulnerabilities", [])]
+    has_hook_overwrite = any(
+        "got" in t or "hook" in t or "vtable" in t for t in vuln_types
+    )
 
     system_content = STAGE_EXPLOIT_SYSTEM.render(
         current_stage=current_stage,
@@ -3924,6 +4047,8 @@ def build_stage_exploit_messages(
         docker_port=state.get("docker_port", 0),
         additions_only=additions_only,
         base_code_snippet=base_code_snippet,
+        confirmed=confirmed,
+        has_hook_overwrite=has_hook_overwrite,
     )
 
     # Generate I/O helper code from decompiled binary
@@ -3952,6 +4077,8 @@ def build_stage_exploit_messages(
         io_helper_code=io_helper_code,
         additions_only=additions_only,
         source_code_snippet=source_code_snippet,
+        confirmed=confirmed,
+        has_hook_overwrite=has_hook_overwrite,
     )
 
     return [

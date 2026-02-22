@@ -24,7 +24,7 @@ from rich.panel import Panel
 
 from Agent.base import BaseAgent, parse_json_response
 from Templates.prompt import build_messages
-from LangGraph.state import upsert_tasks, merge_analysis_updates
+from LangGraph.state import upsert_tasks, merge_analysis_updates, prune_blockers
 
 console = Console()
 
@@ -119,6 +119,8 @@ class PlanAgent(BaseAgent):
             for b in parsed["blockers"]:
                 if b.get("question", "") not in existing:
                     state.setdefault("blockers", []).append(b)
+            # 해결된 블로커 제거, 최대 개수 제한
+            state["blockers"] = prune_blockers(state.get("blockers", []), state.get("analysis", {}))
             console.print(f"[yellow]Blockers: {len(state.get('blockers', []))} total[/yellow]")
 
         if "hypotheses" in parsed and isinstance(parsed["hypotheses"], list):

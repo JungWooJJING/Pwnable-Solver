@@ -396,7 +396,7 @@ def main():
     parser.add_argument("--docker-port", type=int, default=1337, help="Docker port (default: 1337)")
     parser.add_argument("--no-analysis-docker", action="store_true",
                         help="Skip analysis container (pwndbg will run on host)")
-    parser.add_argument("--ask-interval", type=int, default=5, help="Ask to continue every N iterations (0=never)")
+    parser.add_argument("--ask-interval", type=int, default=0, help="Ask to continue every N iterations (0=never, default)")
     parser.add_argument("--max-attempts", type=int, default=3, help="Max exploit verification attempts (default: 3)")
     parser.add_argument("--auto", action="store_true", help="Fully automatic mode (no user prompts during solving)")
     args = parser.parse_args()
