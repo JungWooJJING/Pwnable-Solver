@@ -953,6 +953,33 @@ def Stage_identify_node(
     """
     console.print(Panel("Stage Identify", style="bold magenta"))
 
+    # --- Deterministic PIE stack scan (before LLM) ---
+    # For PIE + win-function binaries, run GDB at break main and scan the stack
+    # for binary-range addresses. This gives us the exact buf_offset of the PIE
+    # pointer so we can compute pattern_len deterministically.
+    analysis = state.get("analysis", {})
+    _result_str = str(analysis.get("checksec", {}).get("result", "")).lower()
+    _has_pie = "pie enabled" in _result_str and "no pie" not in _result_str
+    _has_win = analysis.get("win_function", False)
+
+    if _has_pie and _has_win and not analysis.get("pie_stack_offsets"):
+        binary_path = state.get("binary_path", "")
+        if binary_path:
+            console.print("[cyan]PIE stack scan: scanning stack at break main for binary-range addresses...[/cyan]")
+            try:
+                _offsets = _find_pie_stack_offsets(state, binary_path)
+                if _offsets:
+                    console.print(
+                        f"[bold green]PIE stack scan found {len(_offsets)} address(es): "
+                        + ", ".join(f"buf+{o['buf_offset']}=0x{o['addr']:x}" for o in _offsets)
+                        + "[/bold green]"
+                    )
+                    state.setdefault("analysis", {})["pie_stack_offsets"] = _offsets
+                else:
+                    console.print("[yellow]PIE stack scan: no binary-range addresses found in stack[/yellow]")
+            except Exception as _e:
+                console.print(f"[yellow]PIE stack scan failed: {_e}[/yellow]")
+
     from Agent.exploit import StageIdentifierAgent
 
     agent = StageIdentifierAgent(model=model, provider=provider)
@@ -1005,6 +1032,126 @@ def _looks_like_ascii_text(val: int, width: int = 8) -> bool:
         return False
     printable = sum(1 for b in raw if 0x20 <= b <= 0x7e or b in (0x09, 0x0a, 0x0d))
     return printable >= width - 1  # ≥ 7/8 bytes printable → almost certainly text
+
+
+def _extract_buf_rbp_offset(text: str) -> int:
+    """
+    Parse GDB disassembly output for [rbp - 0x...] references to find buf's
+    offset from RBP. Returns the largest such offset found (the deepest local = buf).
+    Falls back to parsing 'sub rsp, 0x...' for the frame size.
+    """
+    import re as _re
+    ansi = _re.compile(r'\x1b\[[0-9;]*m')
+    clean = ansi.sub('', text)
+
+    max_offset = 0
+    # e.g. [rbp - 0x3f0] or [rbp-0x3f0]
+    for m in _re.finditer(r'\[rbp\s*-\s*0x([0-9a-fA-F]+)\]', clean):
+        val = int(m.group(1), 16)
+        if val > max_offset:
+            max_offset = val
+
+    if max_offset == 0:
+        # fallback: sub rsp, 0xNNN gives total frame size ≈ buf_rbp_offset
+        for m in _re.finditer(r'sub\s+(?:rsp|esp),\s*0x([0-9a-fA-F]+)', clean):
+            val = int(m.group(1), 16)
+            if val > max_offset:
+                max_offset = val
+
+    return max_offset
+
+
+def _find_pie_stack_offsets(state: dict, binary_path: str) -> list:
+    """
+    Run GDB at 'break main' and scan the stack for PIE-range addresses.
+
+    At break main (after prologue: push rbp; mov rbp,rsp), RSP == RBP.
+    'x/30gx $rsp' therefore shows [RBP+0], [RBP+8], [RBP+16], ...
+    Any address in the binary's mapped range that appears at RBP+N
+    is at buf_offset = buf_rbp_offset + N from buf start.
+
+    Returns list of dicts: {"buf_offset": int, "addr": int, "rva": int}.
+    """
+    import re as _re
+    import math as _math
+
+    try:
+        from Tool.tool import Tool as _Tool
+        tool = _Tool(binary_path=binary_path)
+    except Exception:
+        return []
+
+    gdb_output = tool.Pwndbg(commands=[
+        "break main",
+        "run",
+        "p/x $rsp",
+        "disassemble main",
+        "x/30gx $rsp",
+        "vmmap",
+    ], timeout=40)
+
+    if not gdb_output or gdb_output.startswith("Error"):
+        return []
+
+    ansi = _re.compile(r'\x1b\[[0-9;]*m')
+    clean = ansi.sub('', gdb_output)
+
+    # --- Parse vmmap for binary address range ---
+    binary_name = Path(binary_path).name
+    binary_ranges: list = []
+    # pwndbg vmmap: "    0x5555...  0x5556...  r-xp  ...  binary_name"
+    vmmap_re = _re.compile(
+        r'(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+\S+\s+\S+\s+\S+\s+\S*'
+        + _re.escape(binary_name),
+        _re.IGNORECASE,
+    )
+    for m in vmmap_re.finditer(clean):
+        binary_ranges.append((int(m.group(1), 16), int(m.group(2), 16)))
+
+    if not binary_ranges:
+        return []
+
+    binary_start = min(r[0] for r in binary_ranges)
+    binary_end   = max(r[1] for r in binary_ranges)
+
+    # --- Extract buf_rbp_offset ---
+    # First try existing runs (already have disassemble main output)
+    buf_rbp_offset = 0
+    for run in state.get("runs", []):
+        off = _extract_buf_rbp_offset(run.get("stdout", ""))
+        if off > buf_rbp_offset:
+            buf_rbp_offset = off
+    # Also try the fresh GDB output from this session
+    off = _extract_buf_rbp_offset(clean)
+    if off > buf_rbp_offset:
+        buf_rbp_offset = off
+    if buf_rbp_offset == 0:
+        buf_rbp_offset = 1008  # reasonable fallback for typical 1000-byte buffers
+
+    # --- Parse x/30gx $rsp output ---
+    # Format: "0x7fff1234:  0xAAAA  0xBBBB"
+    # Each line shows 2 qwords (16 bytes). Track running index.
+    results: list = []
+    index = 0
+    scan_re = _re.compile(r'0x[0-9a-fA-F]+:\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)')
+    for m in scan_re.finditer(clean):
+        for val_str in [m.group(1), m.group(2)]:
+            val = int(val_str, 16)
+            if binary_start <= val < binary_end:
+                buf_offset = buf_rbp_offset + index * 8
+                rva = val - binary_start
+                # Skip duplicates (same buf_offset)
+                if not any(r["buf_offset"] == buf_offset for r in results):
+                    results.append({
+                        "buf_offset": buf_offset,
+                        "addr": val,
+                        "rva": rva,
+                        "stack_index": index,
+                        "binary_start": binary_start,
+                    })
+            index += 1
+
+    return results
 
 
 def _extract_last_hex_dump(combined: str) -> str:
@@ -1411,29 +1558,69 @@ def Stage_verify_node(
                             return state
 
                     # --- PIE base validation ---
-                    pie_match = re.search(r"pie_leak=0x([0-9a-fA-F]+)", marker_line)
+                    # pie_base= (preferred) or pie_leak= (raw leaked addr) from marker
+                    pie_base_match = re.search(r"pie_base=0x([0-9a-fA-F]+)", marker_line)
+                    pie_leak_match = re.search(r"pie_leak=0x([0-9a-fA-F]+)", marker_line)
+                    pie_match = pie_base_match or pie_leak_match
                     if pie_match:
                         pie_val = int(pie_match.group(1), 16)
+                        # raw leak addr → compute page-aligned base for validation
+                        pie_base_val = pie_val & ~0xfff
                         if pie_val < 0x1000:
-                            console.print(f"[red]Stage {current_idx+1} FAILED (pie_leak=0x{pie_val:x} is invalid — likely wrong offset)[/red]")
+                            # pwntools debug 출력에서 수신 바이트 크기 파싱
+                            recv_sizes = [
+                                int(m, 16)
+                                for m in re.findall(r"\[DEBUG\] Received (0x[0-9a-fA-F]+) bytes", combined)
+                            ]
+                            recv_hint = ""
+                            if recv_sizes:
+                                last_recv = recv_sizes[-1]
+                                # recv에는 printf output + '\n'(1) + "Pattern: "(9) 등 overhead 포함
+                                # printf가 출력한 실제 바이트 수는 recv - overhead
+                                # overhead 최소 추정: \n(1) + next_prompt(~9)
+                                est_printed = max(0, last_recv - 10)
+                                recv_hint = (
+                                    f"\n\nPIE POINTER NOT REACHED — DIAGNOSIS:\n"
+                                    f"  Last server response: {last_recv} bytes (0x{last_recv:x}).\n"
+                                    f"  Estimated printf output before null-stop: ~{est_printed} bytes.\n"
+                                    f"  → printf hit a null byte at ~offset {est_printed} and stopped there.\n"
+                                    f"  → The PIE pointer is at a HIGHER offset on the stack.\n"
+                                    f"  → You need to write MORE non-null bytes to overwrite null bytes in the canary, saved RBP, and saved RIP.\n"
+                                    f"\n"
+                                    f"  CRITICAL — HOW MANY BYTES TO SEND:\n"
+                                    f"  - If pattern is read with `read(STDIN_FILENO, ...)` or `read(0, ...)` (check source!):\n"
+                                    f"    → NO +1 from scanf '\\n'. The '\\n' ungetted by scanf is in stdio's push-back buffer,\n"
+                                    f"      which is INVISIBLE to the raw `read()` syscall.\n"
+                                    f"    → effective_len = EXACTLY the bytes you send. Send 43 to get effective=43.\n"
+                                    f"    → formula: ceil(target_len / pattern_len) * pattern_len = total_written\n"
+                                    f"    → choose pattern_len so ceil(target_len / pattern_len) * pattern_len covers the PIE pointer offset\n"
+                                    f"  - If pattern is read with `fgets()` or `scanf()` (stdio-based):\n"
+                                    f"    → '\\n' from previous scanf IS in stdio buffer → effective = sent + 1\n"
+                                    f"    → Send 42 to get effective=43.\n"
+                                )
+                            last_recv_str = f" | last recv={recv_sizes[-1]}B" if recv_sizes else ""
+                            console.print(f"[red]Stage {current_idx+1} FAILED (pie_leak=0x{pie_val:x} — output truncated short{last_recv_str})[/red]")
                             current_stage["verified"] = False
-                            current_stage["error"] = f"pie_leak=0x{pie_val:x} is invalid (too small — check leak offset)\n" + combined
+                            current_stage["error"] = (
+                                f"pie_leak=0x{pie_val:x} is zero or near-zero — the PIE pointer was NOT reached in the output.\n"
+                                + recv_hint + "\n"
+                            ) + combined
                         elif _looks_like_ascii_text(pie_val):
                             console.print(f"[red]Stage {current_idx+1} FAILED (pie_leak=0x{pie_val:x} looks like ASCII text — I/O desync)[/red]")
                             current_stage["verified"] = False
                             current_stage["error"] = (
                                 f"pie_leak=0x{pie_val:x} bytes look like printable ASCII text — I/O desync.\n"
                             ) + combined
-                        elif (pie_val & 0xfff) != 0:
-                            console.print(f"[red]Stage {current_idx+1} FAILED (pie_leak=0x{pie_val:x} is not page-aligned — binary base must end in 000)[/red]")
+                        elif pie_base_val < 0x100000000000:
+                            # pie base가 너무 낮으면 의심 (64bit PIE는 보통 0x55.../0x56...)
+                            console.print(f"[red]Stage {current_idx+1} FAILED (pie_base=0x{pie_base_val:x} out of expected PIE range)[/red]")
                             current_stage["verified"] = False
                             current_stage["error"] = (
-                                f"pie_leak=0x{pie_val:x} is not page-aligned (0x{pie_val & 0xfff:x} != 0). "
-                                f"PIE base is always a multiple of 0x1000. "
-                                f"Apply: pie_base = leaked_addr & ~0xfff (mask low 12 bits) or subtract the correct static offset.\n"
+                                f"Computed PIE base 0x{pie_base_val:x} is below expected 64-bit PIE range (>= 0x100000000000). "
+                                f"Check the leak offset.\n"
                             ) + combined
                         else:
-                            console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, pie_leak=0x{pie_val:x})[/bold green]")
+                            console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, pie_base=0x{pie_base_val:x})[/bold green]")
                             current_stage["verified"] = True
                     else:
                         # canary/pie 스테이지인데 마커에 pie_leak= 필드가 없으면 FAIL

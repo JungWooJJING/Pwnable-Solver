@@ -3309,23 +3309,35 @@ Replace `<placeholders>` with EXACT strings from the decompiled code (e.g., `b"4
 
 For binaries that repeatedly ask for a pattern and target_len (e.g., a repeat/echo service with a memcpy loop):
 
-### ⚠ scanf leaves `\n` in stdin — affects NEXT read()
+### ⚠ scanf `\n` buffering — CRITICAL: behavior depends on HOW the pattern is read (check source!)
 
-After `scanf("%d")` reads target_len, a `\n` character is LEFT IN STDIN.
-The NEXT `read()` call consumes this `\n` as its FIRST BYTE, making:
-- **Effective pattern_len = bytes_you_sent + 1** (for iterations 2, 3, 4, ...)
+After `scanf("%d")` reads target_len, it reads '\n' from stdin and internally un-reads (ungets) it.
+The '\n' ends up in **stdio's push-back buffer** — but whether this matters depends on how pattern is read:
+
+**Case A — pattern read with `fgets(buf, n, stdin)` or `scanf("%s", buf)` (stdio-based)**:
+→ '\n' is in stdio's internal buffer → consumed as the FIRST byte of the next fgets/scanf read
+→ effective pattern_len = sent_bytes + 1
+→ To achieve effective=43, send only 42 bytes.
+
+**Case B — pattern read with `read(fd, buf, n)` or `read(0, buf, n)` (raw syscall)**:
+→ `read()` is a kernel syscall that reads from fd buffer DIRECTLY, bypassing stdio's push-back
+→ The '\n' ungetted to stdio's internal buffer is **INVISIBLE** to `read()` syscall
+→ effective pattern_len = EXACTLY the bytes you send (no +1)
+→ To achieve effective=43, send EXACTLY 43 bytes.
+→ **Do NOT subtract 1 when using `read()` — sending 42 gives effective=42, not 43.**
 
 ```python
-# Iteration 1 (first ever — no previous scanf \n):
-p.sendafter(b"Pattern: ", b"A" * 10)      # read() gets exactly 10 bytes → pattern_len = 10
-p.sendlineafter(b"Target length: ", b"1000")  # scanf reads 1000, leaves \n
+# ALWAYS use sendafter() so pwntools waits for the prompt before sending:
+p.sendafter(b"Pattern: ", b"A" * 10)           # Case B (read syscall): effective = 10
+p.sendlineafter(b"Target length: ", b"1000")    # scanf reads 1000, leaves \n in stdio buffer
 
-# Iteration 2 (has leftover \n from previous scanf):
-# If you sendafter() — pwntools sends AFTER "Pattern: ", so \n + your_bytes arrive together
-p.sendafter(b"Pattern: ", b"B" * 10)      # read() gets \n + "BBBBBBBBBB" = 11 bytes → pattern_len = 11!
-# To get pattern_len=10 in iteration 2, send only 9 bytes:
-p.sendafter(b"Pattern: ", b"B" * 9)       # read() gets \n + "BBBBBBBBB" = 10 bytes → pattern_len = 10 ✓
+# Iteration 2 — Case B (read() syscall):
+p.sendafter(b"Pattern: ", b"B" * 10)           # read() gets exactly 10 bytes (no +1) → effective = 10
+# Iteration 2 — Case A (fgets/scanf):
+p.sendafter(b"Pattern: ", b"B" * 9)            # fgets gets \n + 9 bytes = 10 effective ✓
 ```
+
+**Check the source code: `read(STDIN_FILENO, ...)` → Case B. `fgets(...)` or `scanf("%s", ...)` → Case A.**
 
 **ALWAYS use `sendafter(b"Pattern: ", ...)` (NOT `send()`) so pwntools waits for the prompt
 before sending, which prevents premature flushing.**
@@ -3346,8 +3358,8 @@ To read data at buf[X] via puts(), write EXACTLY X bytes (buf[0..X-1]) — leavi
 | ❌ WRONG for buf[1032] | 80 | floor(999/80)×80=960, last: buf[960..1039] | **1040** — buf[1032] DESTROYED! |
 
 ```python
-# Verify before coding:
-pattern_len_eff = 43  # effective (include \n from scanf if iteration >= 2)
+# Verify before coding (use the CORRECT effective pattern_len for your Case A/B):
+pattern_len_eff = 43  # Case B (read syscall): send EXACTLY 43 bytes; Case A (fgets): send 42
 target_len = 1000
 target_offset = 1032  # want to expose buf[1032]
 last_count = (target_len - 1) // pattern_len_eff * pattern_len_eff
@@ -3355,8 +3367,11 @@ total_written = last_count + pattern_len_eff
 assert total_written == target_offset, f"WRONG: writes {total_written} bytes, need {target_offset}"
 ```
 
-**REMEMBER**: In iteration 2+, effective pattern_len = sent_bytes + 1 (because of scanf \n).
-So to get effective=43, send 42 bytes. To get effective=11, send 10 bytes.
+**Case B (`read()` syscall) REMEMBER**: effective = exactly sent bytes (NO +1).
+Send EXACTLY 43 bytes to get effective=43. Do NOT send 42.
+
+**Case A (`fgets`/`scanf`) REMEMBER**: effective = sent_bytes + 1 (scanf \n).
+Send 42 bytes to get effective=43. Send 10 bytes to get effective=11.
 
 ## Canary + PIE Leak: MANDATORY Validation Rules
 
@@ -3664,15 +3679,27 @@ Focus on:
   Check the "Last Received Bytes" hexdump above. If all bytes at the target offset are 41/42/43...
   (your fill pattern), you wrote too many bytes. Reduce pattern_len to hit exactly buf[X-1].
 
-- **scanf `\n` I/O desync — effective pattern_len is 1 more than sent bytes**:
-  After `scanf("%d")` reads target_len, a `\n` is left in stdin.
-  The NEXT `read()` call gets `\n` as its FIRST byte → effective pattern_len = sent_bytes + 1.
-  For iteration 2+: to achieve effective=43, send only 42 bytes.
-  **TIMEOUT** often means the inner `while(count < target_len)` is spinning forever because:
-  - The `\n` alone was received as a 1-byte pattern in the next round.
-  - With pattern_len=1 and target_len=1000, the loop repeats 1000 times, looking for more input.
-  Fix: always use `sendafter(b"Pattern: ", ...)` which syncs to the prompt before sending,
-  and count: to achieve effective=N in iteration ≥2, send N-1 bytes.
+- **scanf `\n` buffering — CRITICAL: behavior depends on HOW the pattern is read (check source!)**:
+  After `scanf("%d")` reads target_len, it reads '\n' from stdin and internally un-reads (ungets) it.
+  Where the '\n' ends up depends on the reading function used for the pattern:
+
+  **Case A — pattern read with `fgets(buf, n, stdin)` or `scanf("%s", buf)` (stdio-based)**:
+  → '\n' is in stdio's internal buffer → consumed as the FIRST byte of the next fgets/scanf read
+  → effective pattern_len = 1 (the '\n') + sent_bytes
+  → To achieve effective=43, send only 42 bytes.
+  **TIMEOUT**: `\n` alone (effective=1) causes `while(count < 1000)` to spin 1000× waiting for data.
+  Fix: use `sendafter(b"Pattern: ", ...)` to sync before sending pattern bytes.
+
+  **Case B — pattern read with `read(fd, buf, n)` or `read(0, buf, n)` (raw syscall)**:
+  → `read()` is a kernel syscall that reads from the fd buffer DIRECTLY, bypassing stdio's push-back
+  → The '\n' that scanf ungetted to stdio's internal push-back is INVISIBLE to `read()` syscall
+  → effective pattern_len = EXACTLY the bytes you send (no +1 bonus)
+  → To achieve effective=43, send EXACTLY 43 bytes.
+  **Do NOT subtract 1 when using `read()` — that will give you 42 instead of 43, writing 1008 not 1032.**
+
+  **How to identify which case applies**: Check the source code (provided above).
+  - `read(STDIN_FILENO, inp, ...)` or `read(0, inp, ...)` → Case B (raw syscall, no +1)
+  - `fgets(inp, n, stdin)` or `scanf("%s", inp)` → Case A (stdio, +1 from '\n')
 
 **SHELL_FAILED / no shell with 'STAGE1_OK' printed:**
 - Check the pwntools debug output `[DEBUG] Sent N bytes:` for the exploit payload.

@@ -797,8 +797,11 @@ To stop:
         subprocess.run(["docker", "rm", "-f", analysis_container], capture_output=True)
 
         # 분석 Dockerfile (stdin으로 전달 — 파일 생성 없음)
+        # USER root: 챌린지 이미지가 non-root user로 끝날 경우 apt-get 권한 오류 방지
         analysis_dockerfile = f"""\
 FROM {challenge_image}
+
+USER root
 
 RUN apt-get update -qq && \\
     apt-get install -y gdb python3 python3-pip git wget curl sudo && \\

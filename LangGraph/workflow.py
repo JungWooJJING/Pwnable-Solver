@@ -78,13 +78,14 @@ def build_workflow() -> StateGraph:
     # stage_exploit → stage_verify
     workflow.add_edge("stage_exploit", "stage_verify")
 
-    # stage_verify → (stage_advance | stage_refine | end | plan)
+    # stage_verify → (stage_advance | stage_refine | stage_exploit | end | plan)
     workflow.add_conditional_edges(
         "stage_verify",
         route_after_stage_verify,
         {
             "stage_advance": "stage_advance",
             "stage_refine": "stage_refine",
+            "stage_exploit": "stage_exploit",  # Fresh regeneration (preserves verified stages)
             "end": END,
             "plan": "plan",
         }
@@ -163,7 +164,7 @@ def route_after_feedback(state: SolverState) -> Literal["plan", "stage_identify"
 
 def route_after_stage_verify(
     state: SolverState,
-) -> Literal["stage_advance", "stage_refine", "end", "plan"]:
+) -> Literal["stage_advance", "stage_refine", "stage_exploit", "end", "plan"]:
     """Determine next step after stage verification."""
     from rich.console import Console
     console = Console()
@@ -193,27 +194,45 @@ def route_after_stage_verify(
     else:
         # Stage failed
         attempts = current_stage.get("refinement_attempts", 0)
-        max_attempts = 3
+        max_refine = 3
+        max_regen  = 2  # fresh full regenerations before falling back to plan
 
-        if attempts < max_attempts:
-            console.print(f"[yellow]Stage {current_idx+1} failed (attempt {attempts+1}/{max_attempts}) → refining[/yellow]")
+        if attempts < max_refine:
+            console.print(f"[yellow]Stage {current_idx+1} failed (attempt {attempts+1}/{max_refine}) → refining[/yellow]")
             return "stage_refine"
         else:
-            console.print(f"[red]Stage {current_idx+1} exhausted retries → re-analyzing[/red]")
-            # 실패 컨텍스트를 state에 기록해서 Plan이 인지하도록
-            state["analysis_failure_reason"] = (
-                f"Stage '{current_stage.get('stage_id', '?')}' failed after {max_attempts} refinement attempts. "
-                f"Description: {current_stage.get('description', '')}. "
-                f"Error: {current_stage.get('error', '')[:500]}"
-            )
-            state["exploit_failure_context"] = {
-                "stage_id": current_stage.get("stage_id", ""),
-                "stage_index": current_idx,
-                "code": current_stage.get("code", "")[:2000],
-                "error": current_stage.get("error", "")[:1000],
-                "attempts": max_attempts,
-            }
-            return "plan"
+            # Refinement exhausted — try a fresh full regeneration first
+            # so verified previous stages are NOT lost (no stage_identify reset).
+            regen_count = current_stage.get("regen_count", 0)
+            if regen_count < max_regen:
+                console.print(
+                    f"[yellow]Stage {current_idx+1} refinement exhausted "
+                    f"(regen {regen_count+1}/{max_regen}) → fresh regeneration[/yellow]"
+                )
+                current_stage["refinement_attempts"] = 0
+                current_stage["regen_count"] = regen_count + 1
+                current_stage["code"] = ""
+                current_stage["error"] = ""
+                stages[current_idx] = current_stage
+                state["staged_exploit"]["stages"] = stages
+                return "stage_exploit"  # Regenerate without resetting verified stages
+            else:
+                console.print(f"[red]Stage {current_idx+1} exhausted all retries → re-analyzing[/red]")
+                # 실패 컨텍스트를 state에 기록해서 Plan이 인지하도록
+                state["analysis_failure_reason"] = (
+                    f"Stage '{current_stage.get('stage_id', '?')}' failed after "
+                    f"{max_refine} refinements × {max_regen} regenerations. "
+                    f"Description: {current_stage.get('description', '')}. "
+                    f"Error: {current_stage.get('error', '')[:500]}"
+                )
+                state["exploit_failure_context"] = {
+                    "stage_id": current_stage.get("stage_id", ""),
+                    "stage_index": current_idx,
+                    "code": current_stage.get("code", "")[:2000],
+                    "error": current_stage.get("error", "")[:1000],
+                    "attempts": max_refine * max_regen,
+                }
+                return "plan"
 
 
 def create_app():
