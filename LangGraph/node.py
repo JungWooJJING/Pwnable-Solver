@@ -15,6 +15,7 @@ from LangGraph.state import (
     SolverState as State,
     init_analysis,
 )
+from Agent.base import LLMRetryExhausted
 
 console = Console()
 
@@ -22,6 +23,32 @@ console = Console()
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+def _trim_output_for_context(
+    output: str,
+    max_chars: int = 8000,
+    head_chars: int = 500,
+) -> str:
+    """
+    긴 실행 출력을 LLM context에 맞게 trim.
+    앞부분(설정/초기화 정보) + 뒷부분(실제 실패 지점)을 유지하고 중간을 생략.
+
+    Args:
+        output: 원본 출력 문자열
+        max_chars: 최대 허용 길이
+        head_chars: 앞에서 보존할 글자 수 (초기 컨텍스트용)
+
+    Returns:
+        Trimmed output string
+    """
+    if len(output) <= max_chars:
+        return output
+
+    tail_chars = max_chars - head_chars
+    omitted = len(output) - max_chars
+    head = output[:head_chars]
+    tail = output[-tail_chars:]
+    return f"{head}\n\n[... {omitted} chars omitted ...]\n\n{tail}"
 
 def _slug(s: str) -> str:
     s = (s or "").strip().lower()
@@ -49,6 +76,14 @@ def _challenge_dir_for_state(state: State) -> Path:
     out_dir = root / f"{_slug(name)}_output"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def _binary_for_dynamic_analysis(state: State) -> str:
+    """
+    동적 분석(GDB, 코어 덤프, 바이너리 프로브)에 쓸 바이너리 경로.
+    pwninit 패치가 있으면 패치 바이너리, 없으면 원본. 범용.
+    """
+    return (state.get("patched_binary") or state.get("binary_path") or "").strip()
 
 
 # =============================================================================
@@ -289,6 +324,32 @@ def _run_phase1_recon(state: State, binary_path: str) -> None:
                 "finished_at": _time.time(),
                 "key_findings": ["Main function decompiled"],
             })
+
+            # Shellcode size limit: read(0, buf, N) 패턴에서 N 추출
+            try:
+                import re as _re_sc
+                _rsc = _re_sc.compile(
+                    r'\bread\s*\(\s*(?:0|0x0)\s*,\s*[^,)]+,\s*(0x[0-9a-fA-F]+|\d+)\s*\)'
+                )
+                _sc_matches = _rsc.findall(str(ghidra_raw))
+                _sc_sizes = []
+                for _m in _sc_matches:
+                    try:
+                        _s = int(_m, 16) if _m.startswith("0x") else int(_m)
+                        if 8 <= _s <= 4096:  # 합리적인 shellcode 크기 범위
+                            _sc_sizes.append(_s)
+                    except ValueError:
+                        pass
+                if _sc_sizes:
+                    _sc_limit = min(_sc_sizes)
+                    _facts = state.get("facts", {})
+                    _facts["shellcode_size_limit"] = _sc_limit
+                    state["facts"] = _facts
+                    console.print(
+                        f"[green]Shellcode size limit detected: {_sc_limit} (0x{_sc_limit:x}) bytes[/green]"
+                    )
+            except Exception:
+                pass
         else:
             console.print(f"[yellow]Ghidra returned: {str(ghidra_raw)[:200]}[/yellow]")
     except Exception as e:
@@ -385,6 +446,75 @@ def _run_phase1_recon(state: State, binary_path: str) -> None:
     except Exception as e:
         console.print(f"[yellow]Symbol scan failed: {e}[/yellow]")
 
+    # --- Ghidra: Critical Security Functions Auto-Decompile ---
+    # sandbox, init, setup 등 보안 관련 함수를 자동으로 decompile하여 LLM에 전달.
+    # 바이너리 심볼 스캔에서 발견된 함수 중 critical 키워드와 일치하는 것만 처리.
+    try:
+        CRITICAL_FUNC_KEYWORDS = [
+            "sandbox", "init", "setup", "initialize",
+            "filter", "validate", "check", "verify",
+            "seccomp", "prctl",
+        ]
+        function_symbols = state.get("facts", {}).get("function_symbols", {})
+
+        # 이미 decompile된 함수 이름 집합 (중복 방지)
+        already_decompiled = {
+            f["name"].lower()
+            for f in state.get("analysis", {}).get("decompile", {}).get("functions", [])
+        }
+
+        # func_map에서 critical 키워드를 포함하는 함수 탐지
+        critical_funcs_found = []
+        for fname in function_symbols:
+            fname_lower = fname.lower()
+            if fname_lower in already_decompiled:
+                continue
+            for kw in CRITICAL_FUNC_KEYWORDS:
+                if kw in fname_lower:
+                    critical_funcs_found.append(fname)
+                    break
+
+        if critical_funcs_found:
+            console.print(f"[cyan]Critical security functions detected: {critical_funcs_found} → decompiling...[/cyan]")
+            decompiled_funcs = []
+            for fname in critical_funcs_found[:5]:  # 최대 5개 제한 (성능)
+                try:
+                    raw = tool.Ghidra_decompile_function(function_name=fname)
+                    if raw and not str(raw).startswith("Error:"):
+                        decompiled_funcs.append({
+                            "name": fname,
+                            "address": function_symbols.get(fname, ""),
+                            "code": str(raw)[:4000],
+                        })
+                        console.print(f"[green]Decompiled critical: {fname}[/green]")
+                    else:
+                        console.print(f"[yellow]Critical decompile returned: {str(raw)[:100]}[/yellow]")
+                except Exception as _e:
+                    console.print(f"[yellow]Critical decompile error ({fname}): {_e}[/yellow]")
+
+            if decompiled_funcs:
+                merge_analysis_updates(state, {
+                    "decompile": {
+                        "done": True,
+                        "functions": decompiled_funcs,
+                    }
+                })
+                names_str = ", ".join(f["name"] for f in decompiled_funcs)
+                console.print(f"[bold green]Phase 1: Critical functions decompiled: {names_str}[/bold green]")
+                add_run(state, {
+                    "run_id": f"recon_ghidra_critical_{int(_time.time()*1000)}",
+                    "task_id": "phase1_ghidra_critical",
+                    "commands": [f"Ghidra_decompile_function({f['name']})" for f in decompiled_funcs],
+                    "success": True,
+                    "stdout": "\n\n".join(f"=== {f['name']} ===\n{f['code'][:500]}" for f in decompiled_funcs),
+                    "stderr": "",
+                    "started_at": _time.time(),
+                    "finished_at": _time.time(),
+                    "key_findings": [f"Critical functions decompiled: {names_str}"],
+                })
+    except Exception as e:
+        console.print(f"[dim]Critical function decompile skipped: {e}[/dim]")
+
     # --- Source Code Discovery ---
     # Read any .c source files in the binary's directory and store in state so all
     # agents (Plan, Instruction, Stage Exploit) can use the ground-truth I/O protocol.
@@ -403,6 +533,91 @@ def _run_phase1_recon(state: State, binary_path: str) -> None:
             break
     except Exception:
         pass
+
+    # --- ROPgadget: 핵심 ROP 가젯 자동 추출 ---
+    # NX가 활성화된 바이너리에서 pop rdi / ret 주소를 확정적으로 추출하여
+    # LLM이 매번 다른 주소를 추측하는 진동 현상을 방지.
+    try:
+        checksec_data = state.get("analysis", {}).get("checksec", {})
+        if checksec_data.get("nx", False):
+            rop_result = _sp.run(
+                ["ROPgadget", "--binary", binary_path, "--rop"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if rop_result.returncode == 0 and rop_result.stdout:
+                from Agent.parsing import parse_ropgadget_output
+                gadgets = parse_ropgadget_output(rop_result.stdout)
+                rop_map: dict = {}
+                for g in gadgets:
+                    instr = g.get("instruction", "").strip()
+                    addr  = g.get("address", "")
+                    # 핵심 가젯만 추출 (범용)
+                    if instr in ("pop rdi ; ret", "pop rdi; ret"):
+                        rop_map["pop_rdi"] = addr
+                    elif instr in ("pop rsi ; ret", "pop rsi; ret"):
+                        rop_map["pop_rsi"] = addr
+                    elif instr in ("pop rdx ; ret", "pop rdx; ret"):
+                        rop_map["pop_rdx"] = addr
+                    elif instr == "ret":
+                        rop_map.setdefault("ret", addr)  # 스택 정렬용
+                if rop_map:
+                    facts = state.get("facts", {})
+                    facts["rop_gadgets"] = rop_map
+                    state["facts"] = facts
+                    summary = ", ".join(f"{k}={v}" for k, v in rop_map.items())
+                    console.print(f"[bold green]ROPgadget: {summary}[/bold green]")
+                    add_run(state, {
+                        "run_id": f"recon_ropgadget_{int(_time.time()*1000)}",
+                        "task_id": "phase1_ropgadget",
+                        "commands": ["ROPgadget --rop"],
+                        "success": True,
+                        "stdout": rop_result.stdout[:3000],
+                        "stderr": "",
+                        "started_at": _time.time(),
+                        "finished_at": _time.time(),
+                        "key_findings": [f"ROP gadgets: {summary}"],
+                    })
+    except Exception as e:
+        console.print(f"[dim]ROPgadget scan skipped: {e}[/dim]")
+
+    # --- pwninit: libc 파일이 있으면 바이너리 패치 ---
+    try:
+        import glob as _glob
+        workdir = str(Path(binary_path).resolve().parent)
+        patched_path = Path(workdir) / (Path(binary_path).stem + "_patched")
+
+        # libc 파일 탐지: libc*.so* 패턴 (libc.so.6, libc-2.23.so, libc.so 등)
+        libc_candidates = _glob.glob(str(Path(workdir) / "libc*.so*"))
+        libc_file = Path(libc_candidates[0]) if libc_candidates else None
+
+        if patched_path.exists():
+            # 이미 패치된 바이너리가 있으면 그냥 등록
+            state["patched_binary"] = str(patched_path)
+            console.print(f"[green]Existing patched binary found: {patched_path}[/green]")
+        elif libc_file:
+            console.print(f"[cyan]libc detected ({libc_file.name}) → running pwninit...[/cyan]")
+            pwninit_result = _sp.run(
+                ["pwninit", "--bin", binary_path, "--libc", str(libc_file)],
+                capture_output=True, text=True, timeout=30, cwd=workdir,
+            )
+            if pwninit_result.returncode == 0 and patched_path.exists():
+                state["patched_binary"] = str(patched_path)
+                console.print(f"[bold green]pwninit success → patched binary: {patched_path}[/bold green]")
+                add_run(state, {
+                    "run_id": f"recon_pwninit_{int(_time.time()*1000)}",
+                    "task_id": "phase1_pwninit",
+                    "commands": [f"pwninit --bin {binary_path} --libc {libc_file.name}"],
+                    "success": True,
+                    "stdout": pwninit_result.stdout[:2000],
+                    "stderr": pwninit_result.stderr[:500],
+                    "started_at": _time.time(),
+                    "finished_at": _time.time(),
+                    "key_findings": [f"Patched binary created: {patched_path.name} (libc: {libc_file.name})"],
+                })
+            else:
+                console.print(f"[yellow]pwninit failed (rc={pwninit_result.returncode}): {pwninit_result.stderr[:200]}[/yellow]")
+    except Exception as e:
+        console.print(f"[yellow]pwninit skipped: {e}[/yellow]")
 
     console.print("[green]Phase 1 RECON complete - Plan Agent starts at Phase 2[/green]")
 
@@ -453,7 +668,59 @@ def Feedback_node(
     - Decide whether to loop or go to Exploit
     """
     agent = _get_agent("feedback", model=model, provider=provider)
-    return agent.run(state)
+    result = agent.run(state)
+
+    # ── GDB 강제 카운트 증가 (routing function에서는 state 변경이 반영 안 됨) ──
+    # route_after_feedback()가 "plan"으로 돌려보낼 GDB 강제 조건을 미리 검사해서
+    # gdb_forced_count를 여기서 증가시킴. routing function은 읽기 전용으로 유지.
+    exploit_readiness = result.get("exploit_readiness", {})
+    if (
+        not result.get("loop", True)
+        and not result.get("flag_detected", False)
+        and exploit_readiness.get("recommend_exploit", False)
+    ):
+        analysis = result.get("analysis", {})
+        result_str = str(analysis.get("checksec", {}).get("result", "")).lower()
+        has_canary = "canary found" in result_str and "no canary" not in result_str
+        has_pie = "pie enabled" in result_str and "no pie" not in result_str
+
+        if has_canary or has_pie:
+            dv = analysis.get("dynamic_verification", {})
+            vulns = analysis.get("vulnerabilities", [])
+            vuln_types = {v.get("type", "").lower() for v in vulns}
+            strategy_lower = str(analysis.get("strategy", "")).lower()
+            non_stack = (
+                "use_after_free", "uaf", "heap_overflow", "double_free",
+                "type_confusion", "type confusion", "vtable", "vtable_overwrite",
+            )
+            vuln_norm = {t.replace(" ", "_") for t in vuln_types}
+            has_non_stack = (
+                any(t in non_stack or t.replace("_", " ") in non_stack for t in vuln_norm)
+                or "got overwrite" in strategy_lower or "vtable" in strategy_lower
+                or "type confusion" in strategy_lower or "heap" in strategy_lower
+            )
+            has_win = analysis.get("win_function", False) or bool(analysis.get("win_function_addr"))
+            skip_dv_for_path = has_non_stack and has_win
+            needs_stack_offsets = (
+                any(t in ("buffer_overflow", "bof", "stack_overflow") for t in vuln_types)
+                and not has_non_stack
+            )
+            if needs_stack_offsets:
+                dv_complete = (
+                    dv.get("verified") is True
+                    and isinstance(dv.get("buf_offset_to_canary"), int)
+                    and isinstance(dv.get("buf_offset_to_ret"), int)
+                )
+            else:
+                dv_complete = dv.get("verified") is True
+
+            came_from_stage_failure = bool(result.get("exploit_failure_context"))
+
+            if not dv_complete and not came_from_stage_failure and not skip_dv_for_path:
+                # GDB 강제 조건 충족 → 카운트 증가 (routing function이 읽을 수 있도록)
+                result["gdb_forced_count"] = result.get("gdb_forced_count", 0) + 1
+
+    return result
 
 
 def Exploit_node(
@@ -646,14 +913,15 @@ def Crash_analysis_node(
     import os
 
     binary_path = state.get("binary_path", "")
+    analysis_binary = _binary_for_dynamic_analysis(state) or binary_path
     exploit_error = state.get("exploit_error", "")
     exploit_path = state.get("exploit_path", "")
 
-    if not binary_path:
+    if not analysis_binary:
         console.print("[red]No binary path set[/red]")
         return state
 
-    workdir = Path(binary_path).resolve().parent
+    workdir = Path(analysis_binary).resolve().parent
     challenge_dir = _challenge_dir_for_state(state)
 
     crash_analysis = {
@@ -681,10 +949,10 @@ def Crash_analysis_node(
     gdb_analysis = ""
 
     if core_file and core_file.exists():
-        # Core dump 분석
+        # Core dump 분석 (동적 분석용 바이너리 사용 — 패치 바이너리로 크래시했으면 일치시킴)
         gdb_commands = [
             "set pagination off",
-            f"file {binary_path}",
+            f"file {analysis_binary}",
             f"core-file {core_file}",
             "info registers",
             "bt",  # backtrace
@@ -712,7 +980,7 @@ def Crash_analysis_node(
 
         # Docker 모드: 컨테이너 로그 수집으로 보완
         if state.get("docker_port"):
-            slug = Path(binary_path).stem.lower()
+            slug = Path(analysis_binary).stem.lower()
             slug = re.sub(r"[^a-z0-9._-]+", "_", slug).strip("_") or "unknown"
             container_name = f"pwn_{slug}_container"
             try:
@@ -963,11 +1231,11 @@ def Stage_identify_node(
     _has_win = analysis.get("win_function", False)
 
     if _has_pie and _has_win and not analysis.get("pie_stack_offsets"):
-        binary_path = state.get("binary_path", "")
-        if binary_path:
+        analysis_binary = _binary_for_dynamic_analysis(state) or state.get("binary_path", "")
+        if analysis_binary:
             console.print("[cyan]PIE stack scan: scanning stack at break main for binary-range addresses...[/cyan]")
             try:
-                _offsets = _find_pie_stack_offsets(state, binary_path)
+                _offsets = _find_pie_stack_offsets(state, analysis_binary)
                 if _offsets:
                     console.print(
                         f"[bold green]PIE stack scan found {len(_offsets)} address(es): "
@@ -983,7 +1251,10 @@ def Stage_identify_node(
     from Agent.exploit import StageIdentifierAgent
 
     agent = StageIdentifierAgent(model=model, provider=provider)
-    state = agent.run(state)
+    try:
+        state = agent.run(state)
+    except LLMRetryExhausted as e:
+        console.print(f"[red]Stage identify API exhausted: {e}. Returning state unchanged.[/red]")
     return state
 
 
@@ -1012,9 +1283,11 @@ def Stage_exploit_node(
     from Agent.exploit import StageExploitAgent
 
     agent = StageExploitAgent(model=model, provider=provider)
-    state = agent.run(state)
-
-    console.print(f"[green]Completed: Stage {current_idx+1} code generation[/green]")
+    try:
+        state = agent.run(state)
+        console.print(f"[green]Completed: Stage {current_idx+1} code generation[/green]")
+    except LLMRetryExhausted as e:
+        console.print(f"[red]Stage exploit API exhausted: {e}. Returning state unchanged.[/red]")
     return state
 
 
@@ -1256,16 +1529,19 @@ def _analyze_core_if_exists(binary_path: str, search_dirs: list, since: float) -
 
     console.print(f"[green]Core dump found: {core_file} — running GDB analysis[/green]")
 
+    # gdb binary core 형식으로 positional arg 전달 → pwndbg auto-context 정상 동작
     gdb_cmds = [
         "set pagination off",
-        f"file {binary_path}",
-        f"core-file {core_file}",
-        "info registers rip rsp rbp",
-        "x/20gx $rsp",
-        "bt",
-        "info signal",
+        "info registers",           # 전체 레지스터 (rip/rsp/rbp/rdi/rsi/rdx 등)
+        "x/10i $rip",               # 크래시 지점 인스트럭션
+        "x/20gx $rsp",              # 스택 상위 20개
+        "bt",                       # 백트레이스
+        "info proc mappings",       # 메모리 레이아웃 (ASLR/PIE 확인용)
     ]
-    cmd = ["gdb", "-q", "-batch"] + [arg for c in gdb_cmds for arg in ["-ex", c]]
+    cmd = (
+        ["gdb", "-q", "-batch", binary_path, str(core_file)]
+        + [arg for c in gdb_cmds for arg in ["-ex", c]]
+    )
     analysis_result = ""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
@@ -1287,6 +1563,104 @@ def _analyze_core_if_exists(binary_path: str, search_dirs: list, since: float) -
         pass  # Non-critical — analysis already captured
 
     return analysis_result
+
+
+def _classify_failure_type(error_text: str) -> str:
+    """Classify the type of stage failure from error output text.
+
+    Categories:
+        TIMED_OUT         — exploit hung (bad recvuntil, infinite loop)
+        CONNECTION_CLOSED — remote EOF / pipe broken / server closed
+        EXCEPTION         — Python exception / import error / file not found
+        WRONG_VALUE       — leaked value failed range or sanity check
+        WRONG_FORMAT      — marker found but required fields missing
+        STAGE_FAILED_CODE — exploit code explicitly printed STAGE_FAILED
+        NO_OUTPUT         — expected marker absent, minimal output
+        UNKNOWN           — cannot determine
+    """
+    if not error_text:
+        return "NO_OUTPUT"
+
+    err = error_text[:3000]
+
+    if "TIMEOUT" in err or "timed out after" in err:
+        return "TIMED_OUT"
+
+    if any(kw in err for kw in (
+        "EOFError", "BrokenPipeError", "Connection reset by peer",
+        "EOF occurred in violation", "closed the connection",
+        "[Errno 104]", "[Errno 111]",
+    )):
+        return "CONNECTION_CLOSED"
+
+    if "STAGE_FAILED" in err:
+        return "STAGE_FAILED_CODE"
+
+    if any(kw in err for kw in (
+        "contains no 'pie_leak=0x",
+        "no hex values detected in the marker line",
+        "was found but the line contains no",
+        "marker was found but no hex values",
+        "missing required",
+    )):
+        return "WRONG_FORMAT"
+
+    if any(kw in err for kw in (
+        "not page-aligned",
+        "non-zero LSB",
+        "look like printable ASCII text",
+        "looks like printable ASCII text",
+        "look like ASCII text",
+        "looks like a canonical pointer",
+        "is in STACK range",
+        "STACK address",
+        "is in binary/heap range",
+        "binary/heap range",
+        "out of expected PIE range",
+        "out of valid user-space",
+        "is below 0x10000000000",
+        "PIE pointer was NOT reached",
+        "is zero or near-zero",
+        "invalid (too small)",
+        "printable bytes",
+        "reads prompt text",
+        "No exploit file found",
+    )):
+        return "WRONG_VALUE"
+
+    if "Traceback" in err or err.lstrip().startswith("ERROR:"):
+        return "EXCEPTION"
+
+    if "not found" in err.lower() or ("marker" in err.lower() and "not" in err.lower()):
+        return "NO_OUTPUT"
+
+    return "UNKNOWN"
+
+
+def _set_failure_type(stage: dict) -> None:
+    """Set failure_type without appending to history.
+
+    Called from Stage_verify_node so the Refiner template can show
+    failure_type.  History is maintained separately by Stage_refine_node via
+    _record_failure_type() to avoid double-counting.
+    """
+    if stage.get("verified"):
+        return
+    stage["failure_type"] = _classify_failure_type(stage.get("error", ""))
+
+
+def _record_failure_type(stage: dict) -> None:
+    """Classify and APPEND failure_type to stage history.
+
+    Called from Stage_refine_node (once per refinement cycle) so that
+    route_after_stage_verify can detect repeated same-type failures and
+    escalate early.  No-op for verified stages.
+    """
+    if stage.get("verified"):
+        return
+    ft = _classify_failure_type(stage.get("error", ""))
+    stage.setdefault("failure_type_history", []).append(ft)
+    stage["failure_type"] = ft
 
 
 def Stage_verify_node(
@@ -1320,14 +1694,16 @@ def Stage_verify_node(
         console.print("[red]No exploit file to run[/red]")
         current_stage["verified"] = False
         current_stage["error"] = "No exploit file found"
+        _set_failure_type(current_stage)
         stages[current_idx] = current_stage
         state["staged_exploit"]["stages"] = stages
         return state
 
     binary_path = state.get("binary_path", "")
+    analysis_binary = _binary_for_dynamic_analysis(state) or binary_path
     _core_search_dirs = [str(Path(exploit_path).parent), "/tmp"]
-    if binary_path:
-        _core_search_dirs.insert(0, str(Path(binary_path).parent))
+    if analysis_binary or binary_path:
+        _core_search_dirs.insert(0, str(Path(analysis_binary or binary_path).parent))
     _run_start = 0.0
 
     # Pre-run: detect hardcoded PIE base when PIE is enabled
@@ -1339,6 +1715,21 @@ def Stage_verify_node(
         _pie_warn = _find_hardcoded_pie_base(exploit_path)
         if _pie_warn:
             console.print(f"[yellow]⚠ {_pie_warn.strip()}[/yellow]")
+
+    # p.interactive() 자동 제거 — 자동화 환경에서 무한 블로킹을 유발함.
+    # 프롬프트에 "NEVER use p.interactive()"가 있음에도 LLM이 삽입하는 경우가 있어
+    # 실행 직전에 코드 레벨에서 제거하여 60초 TIMEOUT을 원천 차단.
+    try:
+        _code_text = Path(exploit_path).read_text(encoding="utf-8", errors="replace")
+        if "p.interactive()" in _code_text:
+            console.print("[yellow]⚠ p.interactive() detected — auto-removing to prevent subprocess hang[/yellow]")
+            _fixed = _code_text.replace(
+                "p.interactive()",
+                "pass  # p.interactive() removed: non-interactive automation environment",
+            )
+            Path(exploit_path).write_text(_fixed, encoding="utf-8")
+    except Exception:
+        pass
 
     console.print(f"[cyan]Running Stage {current_idx+1}: {current_stage['stage_id']}...[/cyan]")
 
@@ -1376,13 +1767,13 @@ def Stage_verify_node(
 
         # Probe the binary to capture its actual I/O output so the refiner can
         # identify wrong recvuntil() strings (the most common cause of timeout).
-        if binary_path and Path(binary_path).exists():
+        if analysis_binary and Path(analysis_binary).exists():
             try:
                 import pty, os as _os, select as _sel, time as _t
                 # Run binary briefly, send a newline, capture first ~500 bytes of output
                 master_fd, slave_fd = pty.openpty()
                 probe_proc = subprocess.Popen(
-                    [binary_path],
+                    [analysis_binary],
                     stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
                     close_fds=True,
                 )
@@ -1417,10 +1808,11 @@ def Stage_verify_node(
         current_stage["verified"] = False
         current_stage["error"] = combined
         current_stage["last_hex_dump"] = _extract_last_hex_dump(combined)
-        # Opportunistic crash analysis
-        _crash_info = _analyze_core_if_exists(binary_path, _core_search_dirs, _run_start)
+        # Opportunistic crash analysis (동적 분석용 바이너리로 코어 분석 — 범용)
+        _crash_info = _analyze_core_if_exists(analysis_binary, _core_search_dirs, _run_start)
         if _crash_info:
             current_stage["error"] += "\n\n=== CORE DUMP ANALYSIS ===\n" + _crash_info
+        _set_failure_type(current_stage)
         stages[current_idx] = current_stage
         state["staged_exploit"]["stages"] = stages
         return state
@@ -1429,10 +1821,11 @@ def Stage_verify_node(
         console.print(f"[red]{combined}[/red]")
         current_stage["verified"] = False
         current_stage["error"] = combined
-        # Opportunistic crash analysis
-        _crash_info = _analyze_core_if_exists(binary_path, _core_search_dirs, _run_start)
+        # Opportunistic crash analysis (동적 분석용 바이너리로 코어 분석 — 범용)
+        _crash_info = _analyze_core_if_exists(analysis_binary, _core_search_dirs, _run_start)
         if _crash_info:
             current_stage["error"] += "\n\n=== CORE DUMP ANALYSIS ===\n" + _crash_info
+        _set_failure_type(current_stage)
         stages[current_idx] = current_stage
         state["staged_exploit"]["stages"] = stages
         return state
@@ -1540,6 +1933,46 @@ def Stage_verify_node(
                             stages[current_idx] = current_stage
                             state["staged_exploit"]["stages"] = stages
                             return state
+                        elif canary_val >= 0x7FF000000000:
+                            # x86-64 stack is in high half (e.g. 0x7ffe..., 0x7ffd...). Reject as false positive.
+                            console.print(
+                                f"[red]Stage {current_idx+1} FAILED "
+                                f"(canary=0x{canary_val:x} is STACK address >= 0x7ff000000000, not canary)[/red]"
+                            )
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"canary=0x{canary_val:x} is in STACK range (>= 0x7ff000000000). "
+                                f"You are reading the wrong offset (e.g. saved RBP). Use the verified canary offset "
+                                f"from analysis (e.g. buf_offset_to_canary), not a larger index.\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
+                        elif (canary_val >> 48) == 0 and canary_val > 0x1000:
+                            # x86-64 canonical user-space addresses have bits 48-63 = 0x0000
+                            # (e.g. 0x00007fff... stack, 0x00007f... libc, 0x00007b... WSL2 libc).
+                            # A real stack canary is a random 64-bit value — the probability that
+                            # its top 2 bytes are both 0x00 AND the value is > 0x1000 is ~1/65536,
+                            # which makes this check a reliable pointer-address detector.
+                            console.print(
+                                f"[red]Stage {current_idx+1} FAILED "
+                                f"(canary=0x{canary_val:x} looks like a canonical pointer — "
+                                f"upper 16 bits are 0x0000, typical of stack/libc addresses. "
+                                f"Real canaries have random upper bytes.)[/red]"
+                            )
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"canary=0x{canary_val:x} has upper 16 bits = 0x0000, matching the pattern "
+                                f"of x86-64 canonical user-space addresses (stack: 0x00007fff..., "
+                                f"libc: 0x00007f... or lower on WSL2/Docker). "
+                                f"This is almost certainly a stack or library address, NOT the canary. "
+                                f"The exploit is reading from the wrong index — check the canary offset "
+                                f"from the buffer start (e.g. Ghidra: canary at RBP-0x10, buffer at RBP-0x1F "
+                                f"→ canary_index = 0x1F - 0x10 = 15, not 23).\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
 
                     # --- Raw return address validation (before masking) ---
                     raw_ret_match = re.search(r"raw_ret=0x([0-9a-fA-F]+)", marker_line)
@@ -1555,6 +1988,56 @@ def Stage_verify_node(
                                 f"This is prompt text, not a real return address. "
                                 f"printf stopped at a null byte before reaching the return address (likely in saved RBP). "
                                 f"The return address was never in the received output.\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
+
+                    # --- libc_base validation (reject stack address or invalid range) ---
+                    libc_base_match = re.search(r"libc_base=0x([0-9a-fA-F]+)", marker_line)
+                    if libc_base_match and "libc" in stage_id_lower:
+                        libc_base_val = int(libc_base_match.group(1), 16)
+                        # x86-64: libc typically 0x7f...; stack 0x7ff... (e.g. 0x7ffd...). Page-aligned.
+                        if (libc_base_val & 0xFFF) != 0:
+                            console.print(
+                                f"[red]Stage {current_idx+1} FAILED "
+                                f"(libc_base=0x{libc_base_val:x} is not page-aligned — invalid)[/red]"
+                            )
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"libc_base=0x{libc_base_val:x} is not page-aligned (expected & 0xfff == 0). "
+                                f"Likely wrong leak or wrong offset.\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
+                        if libc_base_val >= 0x7FF000000000:
+                            console.print(
+                                f"[red]Stage {current_idx+1} FAILED "
+                                f"(libc_base=0x{libc_base_val:x} is STACK range, not libc — false positive)[/red]"
+                            )
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"libc_base=0x{libc_base_val:x} is in STACK range (>= 0x7ff000000000), not a valid libc base. "
+                                f"Do not treat this as STAGE1_OK. Check leak offset and that the leaked value is from libc.\n"
+                            ) + combined
+                            stages[current_idx] = current_stage
+                            state["staged_exploit"]["stages"] = stages
+                            return state
+                        # Lower bound: 0x10000000000 (1TB) — generous enough for WSL2/Docker/VM
+                        # environments where libc can be mapped at 0x72d.., 0x73e.., 0x7b.. etc.
+                        # Upper bound already handled by stack-range check above.
+                        if libc_base_val < 0x10000000000:
+                            console.print(
+                                f"[red]Stage {current_idx+1} FAILED "
+                                f"(libc_base=0x{libc_base_val:x} out of valid user-space shared-lib range "
+                                f"[0x10000000000, 0x7ff000000000))[/red]"
+                            )
+                            current_stage["verified"] = False
+                            current_stage["error"] = (
+                                f"libc_base=0x{libc_base_val:x} is below 0x10000000000 — likely a binary, heap, "
+                                f"or wrong offset. Valid x86-64 shared-lib range: [0x10000000000, 0x7ff000000000). "
+                                f"Check leak calculation.\n"
                             ) + combined
                             stages[current_idx] = current_stage
                             state["staged_exploit"]["stages"] = stages
@@ -1672,11 +2155,71 @@ def Stage_verify_node(
                     addr_match = re.search(r"0x([0-9a-fA-F]+)", marker_line)
                     if addr_match:
                         addr_val = int(addr_match.group(1), 16)
+                        is_libc_stage = "libc" in stage_id_lower or "leak" in stage_id_lower
+
                         if addr_val < 0x1000:
                             console.print(f"[red]Stage {current_idx+1} FAILED (leaked value 0x{addr_val:x} is too small — likely invalid)[/red]")
                             current_stage["verified"] = False
                             current_stage["error"] = f"Leaked value 0x{addr_val:x} is invalid (too small)\n" + combined
+                        elif is_libc_stage:
+                            # libc/leak stage: 주소 범위 검증
+                            # x86-64 user space: 0 ~ 0x7fffffffffff (47-bit)
+                            # shared libs (mmap):  0x10000000000 ~ 0x7feff fffffff
+                            #   WSL2/Docker/VM 환경에서는 0x70..., 0x7b..., 0x72d... 등 다양
+                            # x86-32: libc는 0xf6000000 ~ 0xffffffff
+                            # 스택:   0x7ff000000000 이상 (x86-64) — always top of user space
+                            # binary/heap: typically < 0x10000000000 (1TB) for x86-64
+                            is_64bit_libc = 0x10000000000 <= addr_val < 0x7ff000000000
+                            is_32bit_libc = 0xf6000000 <= addr_val <= 0xffffffff
+                            is_stack    = addr_val >= 0x7ff000000000
+                            is_binary   = addr_val < 0x10000000000  # <1TB: binary/heap 영역
+
+                            if is_64bit_libc or is_32bit_libc:
+                                console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, addr=0x{addr_val:x})[/bold green]")
+                                current_stage["verified"] = True
+                            elif is_stack:
+                                # 스택 주소: 0x7ff000000000 이상
+                                # libc stage에서 스택 주소가 나오면 ROP 체인이 실행되지 않은 것
+                                console.print(
+                                    f"[red]Stage {current_idx+1} FAILED "
+                                    f"(0x{addr_val:x} is a STACK address ≥ 0x7ff000000000, not libc — "
+                                    f"ROP chain did not execute. Check: "
+                                    f"(1) p.clean() before Stage 2, "
+                                    f"(2) buf_offset_to_ret, "
+                                    f"(3) ROP gadget addresses)[/red]"
+                                )
+                                current_stage["verified"] = False
+                                current_stage["error"] = (
+                                    f"Leaked address 0x{addr_val:x} is in STACK range (>= 0x7ff000000000), "
+                                    f"not a valid libc address.\n"
+                                    f"Root causes to check:\n"
+                                    f"  1. Stage 1 output was NOT flushed before Stage 2 — add p.clean(timeout=0.5)\n"
+                                    f"  2. buf_offset_to_ret may be wrong — ROP chain overwrote wrong location\n"
+                                    f"  3. ROP gadgets (pop_rdi, ret) may have incorrect addresses\n"
+                                ) + combined
+                            else:
+                                # 바이너리/힙 영역 (<1TB) — libc stage에서는 invalid
+                                console.print(
+                                    f"[red]Stage {current_idx+1} FAILED "
+                                    f"(0x{addr_val:x} is in binary/heap range (<0x10000000000), not libc — "
+                                    f"valid 64-bit shared-lib range: [0x10000000000, 0x7ff000000000). "
+                                    f"Check leak offset and puts() null-termination.)[/red]"
+                                )
+                                current_stage["verified"] = False
+                                current_stage["error"] = (
+                                    f"Leaked address 0x{addr_val:x} is in binary/heap range (< 0x10000000000).\n"
+                                    f"Valid x86-64 shared-lib range: [0x10000000000, 0x7ff000000000).\n"
+                                    f"NOTE: On WSL2/Docker/VM, libc may be at 0x7bc..., 0x73e..., 0x72d... "
+                                    f"which all fall within the valid range. If the value is very small "
+                                    f"(e.g. 0x4015d0), it is a binary .text address, not libc.\n"
+                                    f"Root causes to check:\n"
+                                    f"  1. Wrong stack offset — leaking binary .text / saved RBP instead of ret addr\n"
+                                    f"  2. puts() null-termination — padding null bytes stop the leak early\n"
+                                    f"  3. Wrong GOT entry — leaked non-libc function pointer\n"
+                                    f"  4. Incorrect libc base calculation offset\n"
+                                ) + combined
                         else:
+                            # Non-libc/leak stage: addr >= 0x1000 이면 통과
                             console.print(f"[bold green]Stage {current_idx+1} VERIFIED ({marker} found, addr=0x{addr_val:x})[/bold green]")
                             current_stage["verified"] = True
                     else:
@@ -1694,9 +2237,14 @@ def Stage_verify_node(
     stages[current_idx] = current_stage
     state["staged_exploit"]["stages"] = stages
 
-    # Opportunistic crash analysis + pre-run warnings for any non-early-return failure path
+    # Persist verified stage code for reuse (e.g. canary_leak) when the same stage_id appears in a later strategy
+    if current_stage.get("verified") and current_stage.get("code") and current_stage.get("stage_id"):
+        state.setdefault("verified_stage_code_by_id", {})[current_stage["stage_id"]] = current_stage["code"]
+
+    # Opportunistic crash analysis + pre-run warnings for any non-early-return failure path (동적 분석용 바이너리 사용 — 범용)
     if not current_stage.get("verified"):
-        _crash_info = _analyze_core_if_exists(binary_path, _core_search_dirs, _run_start)
+        _set_failure_type(current_stage)  # classify before crash suffix
+        _crash_info = _analyze_core_if_exists(analysis_binary, _core_search_dirs, _run_start)
         suffix = ""
         if _pie_warn:
             suffix += _pie_warn
@@ -1730,14 +2278,22 @@ def Stage_refine_node(
     current_stage = stages[current_idx]
     current_stage["refinement_attempts"] = current_stage.get("refinement_attempts", 0) + 1
 
+    # Record failure type for escalation tracking (catches inline early-return cases
+    # that Stage_verify_node didn't classify, e.g. canary/libc range check failures).
+    _record_failure_type(current_stage)
+
     from Agent.exploit import StageRefinerAgent
 
     refiner = StageRefinerAgent(model=model, provider=provider)
-    state = refiner.run(
-        state=state,
-        stage=current_stage,
-        error_output=current_stage.get("error", ""),
-    )
+    error_output = _trim_output_for_context(current_stage.get("error", ""))
+    try:
+        state = refiner.run(
+            state=state,
+            stage=current_stage,
+            error_output=error_output,
+        )
+    except LLMRetryExhausted as e:
+        console.print(f"[red]Stage refine API exhausted: {e}. Returning state unchanged.[/red]")
 
     return state
 

@@ -384,8 +384,18 @@ class Tool:
             return "\n".join([ln for ln in text.splitlines() if q in ln.lower()])
         return text
     
-    def Pwndbg(self, commands: Optional[list[str]] = None, timeout: int = 30) -> str:
-        if not self.binary_path:
+    def Pwndbg(
+        self,
+        commands: Optional[list[str]] = None,
+        timeout: int = 30,
+        dynamic_binary: Optional[str] = None,
+    ) -> str:
+        """Run GDB/pwndbg. Use dynamic_binary (e.g. patched from pwninit) when provided for analysis."""
+        # 동적 분석용 바이너리: dynamic_binary가 있으면 사용, 없으면 binary_path (범용)
+        binary_for_gdb = self.binary_path
+        if dynamic_binary and Path(dynamic_binary).exists():
+            binary_for_gdb = dynamic_binary
+        if not binary_for_gdb:
             return "Error: binary_path is not set"
 
         # 분석 컨테이너가 실행 중이면 docker exec로 실행
@@ -393,7 +403,7 @@ class Tool:
         analysis_container = f"pwn_{slug}_analysis"
         if self._is_container_running(analysis_container):
             container_workdir = self._get_container_workdir(analysis_container)
-            binary_name = Path(self.binary_path).name
+            binary_name = Path(binary_for_gdb).name
             binary_in_container = f"{container_workdir}/{binary_name}"
             console.print(
                 f"[cyan]Pwndbg: using analysis container "
@@ -405,17 +415,26 @@ class Tool:
 
         # fallback: 호스트에서 직접 실행
         console.print("[dim]Pwndbg: analysis container not found — running on host[/dim]")
-        return self._pwndbg_host(commands, timeout)
+        return self._pwndbg_host(commands, timeout, binary_for_gdb)
 
-    def _pwndbg_host(self, commands: Optional[list[str]] = None, timeout: int = 30) -> str:
-        """호스트 GDB(pwndbg)로 실행."""
+    # GDB 실행 시 바이너리가 read() 호출로 블록되지 않도록 제공하는 프로브 입력.
+    # 대부분의 CTF 바이너리는 짧은 입력을 받으므로 이 정도로 충분.
+    _GDB_PROBE_INPUT = "\n" * 4 + "A" * 256 + "\n" * 8
+
+    def _pwndbg_host(
+        self,
+        commands: Optional[list[str]] = None,
+        timeout: int = 30,
+        binary_for_gdb: Optional[str] = None,
+    ) -> str:
+        """호스트 GDB(pwndbg)로 실행. binary_for_gdb가 있으면 해당 바이너리 사용."""
         cmds = list(commands or [])
+        binary_to_run = binary_for_gdb if binary_for_gdb else self.binary_path
         # NOTE: do NOT use -nx — it skips .gdbinit and prevents pwndbg from loading.
-        # pwndbg extensions (vmmap, heap, bins, etc.) require .gdbinit to be sourced.
         cmd = ["gdb", "-q", "-batch", "-ex", "set pagination off", "-ex", "set confirm off"]
         for c in cmds:
             cmd += ["-ex", c]
-        cmd += ["--args", self.binary_path]
+        cmd += ["--args", binary_to_run]
 
         import resource
 
@@ -429,13 +448,18 @@ class Tool:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                stdin=subprocess.DEVNULL,
+                # stdin=DEVNULL 대신 프로브 입력 제공:
+                # 바이너리가 read()/scanf() 등으로 블록될 때 stdin이 EOF이면
+                # 즉시 반환하거나 예상치 못한 동작을 유발함.
+                # 충분한 입력을 제공하면 바이너리가 정상적으로 실행 흐름을
+                # 지속하고 GDB 브레이크포인트/레지스터 덤프에 도달할 수 있음.
+                input=self._GDB_PROBE_INPUT,
                 text=True,
                 timeout=timeout,
                 preexec_fn=_enable_core,
             )
         except subprocess.TimeoutExpired:
-            return "Error: gdb timed out — binary likely blocked waiting for stdin input"
+            return "Error: gdb timed out — binary likely blocked waiting for more stdin input than probe provides"
         except FileNotFoundError:
             return "Error: gdb not found"
         out = (result.stdout or "").strip()
@@ -453,9 +477,9 @@ class Tool:
     ) -> str:
         """분석 컨테이너 내부에서 docker exec로 GDB(pwndbg) 실행."""
         cmds = list(commands or [])
-        # docker exec -i 로 stdin을 닫은 채 실행
+        # docker exec -i: stdin을 파이프로 연결해서 프로브 입력이 컨테이너 안까지 전달되게 함
         cmd = [
-            "docker", "exec", container_name,
+            "docker", "exec", "-i", container_name,
             "gdb", "-q", "-batch",
             "-ex", "set pagination off",
             "-ex", "set confirm off",
@@ -468,12 +492,14 @@ class Tool:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                stdin=subprocess.DEVNULL,
+                # _pwndbg_host()와 동일 이유로 프로브 입력 제공.
+                # docker exec -i 가 있어야 컨테이너 내부 프로세스에 stdin이 전달됨.
+                input=self._GDB_PROBE_INPUT,
                 text=True,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
-            return "Error: gdb (docker) timed out — binary likely blocked waiting for stdin input"
+            return "Error: gdb (docker) timed out — binary likely blocked waiting for more stdin input than probe provides"
         except FileNotFoundError:
             return "Error: docker not found"
         out = (result.stdout or "").strip()
@@ -485,8 +511,14 @@ class Tool:
     def One_gadget(self) -> str:
         if not self.binary_path:
             return "Error: binary_path is not set"
-        
-        cmd = ["one_gadget", self.binary_path]
+        # one_gadget는 libc 대상. 도커에서 추출한 libc.so.6이 있으면 사용(범용).
+        workdir = Path(self.binary_path).resolve().parent
+        libc_path = workdir / "libc.so.6"
+        if libc_path.exists():
+            target = str(libc_path)
+        else:
+            target = self.binary_path
+        cmd = ["one_gadget", target]
         result = subprocess.run(cmd, capture_output=True, text=True)
         out = (result.stdout or "").strip()
         err = (result.stderr or "").strip()
@@ -529,6 +561,16 @@ class Tool:
         slug = self._slug(Path(self.binary_path).stem)
         image_name = f"pwn_{slug}"
         container_name = f"pwn_{slug}_container"
+
+        # libc가 이미 있으면 도커 빌드 불필요 — 로컬 환경에서 직접 사용 가능
+        import glob as _glob
+        _existing_libc = sorted(_glob.glob(str(workdir / "libc*.so*")))
+        if _existing_libc:
+            console.print(
+                f"[yellow]Docker_setup: libc already present ({Path(_existing_libc[0]).name}) "
+                f"— skipping Docker build[/yellow]"
+            )
+            return f"Skipped: libc already present at {_existing_libc[0]}"
 
         # Dockerfile 존재 확인
         dockerfile_path = workdir / "Dockerfile"
@@ -640,6 +682,164 @@ To stop:
 """
         self._write_artifact("docker_setup", result, suffix=".txt")
         return result
+
+    def Docker_extract_libc(self, container_name: Optional[str] = None) -> str:
+        """
+        실행 중인 챌린지 컨테이너에서 libc를 호스트 workdir로 추출.
+
+        어떤 바이너리/Ubuntu 버전에서도 동작하는 범용 메서드.
+        - /lib, /usr/lib, /lib64, /lib/x86_64-linux-gnu 등 주요 경로를 탐색
+        - libc-2.xx.so 형식의 versioned so를 우선 선택
+        - 없으면 libc.so.6 symlink 대상을 사용
+
+        Args:
+            container_name: 대상 컨테이너 이름. None이면 binary_path 기반으로 자동 결정.
+
+        Returns:
+            추출된 libc 호스트 경로 (예: /path/to/challenge/libc.so.6), 실패 시 ""
+        """
+        if not self.binary_path:
+            return ""
+
+        workdir = Path(self.binary_path).resolve().parent
+
+        # Skip extraction if libc is already present in the workdir
+        import glob as _glob
+        existing_libc = sorted(_glob.glob(str(workdir / "libc*.so*")))
+        if existing_libc:
+            libc_path = existing_libc[0]
+            console.print(f"[green]Docker_extract_libc: libc already present → {libc_path} (skipping extraction)[/green]")
+            return libc_path
+
+        slug = self._slug(Path(self.binary_path).stem)
+        container_name = container_name or f"pwn_{slug}_container"
+
+        if not self._is_container_running(container_name):
+            console.print(f"[yellow]Docker_extract_libc: container '{container_name}' not running[/yellow]")
+            return ""
+
+        libc_in_container: Optional[str] = None
+
+        # ── Strategy 1: ldconfig -p (가장 신뢰도 높음 — 런타임 링커 캐시 기반) ──
+        # 출력 예: "libc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6"
+        ldconfig_result = subprocess.run(
+            ["docker", "exec", container_name, "sh", "-c", "ldconfig -p 2>/dev/null | grep -E '\\blibc\\.so\\.'"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in (ldconfig_result.stdout or "").splitlines():
+            m = re.search(r"=>\s*(\S+libc\.so\.\S*)", line)
+            if m:
+                libc_in_container = m.group(1).strip()
+                console.print(f"[dim]Docker_extract_libc: ldconfig found {libc_in_container}[/dim]")
+                break
+
+        # ── Strategy 2: ldd <binary> (바이너리 기준 런타임 libc 경로) ──
+        if not libc_in_container:
+            binary_name = Path(self.binary_path).name
+            container_workdir = self._get_container_workdir(container_name) or "/challenge"
+            binary_in_container = f"{container_workdir}/{binary_name}"
+            ldd_result = subprocess.run(
+                ["docker", "exec", container_name, "ldd", binary_in_container],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in (ldd_result.stdout or "").splitlines():
+                m = re.search(r"libc\.so\.\d+\s*=>\s*(\S+)", line)
+                if m:
+                    libc_in_container = m.group(1).strip()
+                    console.print(f"[dim]Docker_extract_libc: ldd found {libc_in_container}[/dim]")
+                    break
+
+        # ── Strategy 3: find — 정확한 이름 패턴만 (libcap/libcrypt 제외) ──
+        # 패턴: libc.so.N 또는 libc-X.Y.so — libcap/libcrypt 등은 매칭하지 않음
+        if not libc_in_container:
+            find_result = subprocess.run(
+                [
+                    "docker", "exec", container_name, "sh", "-c",
+                    r"find /lib /usr/lib /lib64 /usr/lib64 -maxdepth 5 "
+                    r"\( -name 'libc.so.*' -o -name 'libc-*.so' \) 2>/dev/null",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            candidates = [p.strip() for p in find_result.stdout.splitlines() if p.strip()]
+            if candidates:
+                versioned = [p for p in candidates if re.search(r"libc-\d+\.\d+\.so$", p)]
+                libc_in_container = versioned[0] if versioned else candidates[0]
+                console.print(f"[dim]Docker_extract_libc: find found {libc_in_container}[/dim]")
+
+        if not libc_in_container:
+            console.print(f"[yellow]Docker_extract_libc: no libc found in container '{container_name}'[/yellow]")
+            return ""
+
+        # Resolve symlink so we copy the real libc file
+        realpath_result = subprocess.run(
+            ["docker", "exec", container_name, "readlink", "-f", libc_in_container],
+            capture_output=True, text=True, timeout=5,
+        )
+        copy_src = (realpath_result.stdout or "").strip() or libc_in_container
+        if copy_src != libc_in_container:
+            console.print(f"[dim]Docker_extract_libc: resolved {libc_in_container} -> {copy_src}[/dim]")
+
+        console.print(f"[cyan]Docker_extract_libc: copying {copy_src} from '{container_name}'...[/cyan]")
+
+        dest_path = workdir / "libc.so.6"
+        cp_result = subprocess.run(
+            ["docker", "cp", f"{container_name}:{copy_src}", str(dest_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+
+        if cp_result.returncode != 0:
+            console.print(f"[red]Docker_extract_libc: copy failed — {cp_result.stderr.strip()}[/red]")
+            return ""
+
+        # ── 추출 후 검증: 진짜 libc인지 확인 ──
+        # readelf로 'system' 심볼이 있는지 확인 (libcap/libcrypt 등에는 없음)
+        validate_result = subprocess.run(
+            ["docker", "exec", container_name, "sh", "-c",
+             f"readelf -Ws '{copy_src}' 2>/dev/null | grep -w 'system'"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if not validate_result.stdout.strip():
+            # 호스트에서도 한 번 더 시도 (nm -D로 확인)
+            nm_result = subprocess.run(
+                ["nm", "-D", str(dest_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if "system" not in nm_result.stdout:
+                console.print(
+                    f"[red]Docker_extract_libc: validation FAILED — '{copy_src}' has no 'system' symbol "
+                    f"(likely libcap/libcrypt, not glibc). Trying fallback...[/red]"
+                )
+                dest_path.unlink(missing_ok=True)
+                # 검증 실패: libc.so.6 심링크를 직접 resolve해서 재시도
+                direct_result = subprocess.run(
+                    ["docker", "exec", container_name, "sh", "-c",
+                     "readlink -f /lib/x86_64-linux-gnu/libc.so.6 2>/dev/null || "
+                     "readlink -f /lib/aarch64-linux-gnu/libc.so.6 2>/dev/null || "
+                     "readlink -f /lib/i386-linux-gnu/libc.so.6 2>/dev/null || "
+                     "readlink -f /lib/libc.so.6 2>/dev/null"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                fallback_src = (direct_result.stdout or "").strip()
+                if fallback_src and fallback_src != copy_src:
+                    cp2 = subprocess.run(
+                        ["docker", "cp", f"{container_name}:{fallback_src}", str(dest_path)],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    if cp2.returncode != 0:
+                        console.print(f"[red]Docker_extract_libc: fallback copy failed — {cp2.stderr.strip()}[/red]")
+                        return ""
+                    nm2 = subprocess.run(["nm", "-D", str(dest_path)], capture_output=True, text=True, timeout=10)
+                    if "system" not in nm2.stdout:
+                        console.print(f"[red]Docker_extract_libc: fallback also invalid — giving up[/red]")
+                        dest_path.unlink(missing_ok=True)
+                        return ""
+                    console.print(f"[green]Docker_extract_libc: fallback libc extracted → {dest_path}[/green]")
+                else:
+                    return ""
+
+        console.print(f"[bold green]Docker_extract_libc: libc extracted → {dest_path}[/bold green]")
+        self._write_artifact("docker_libc_path", str(dest_path), suffix=".txt")
+        return str(dest_path)
 
     def Docker_exploit_test(
         self,

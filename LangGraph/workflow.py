@@ -32,6 +32,8 @@ from LangGraph.node import (
     Stage_verify_node,
     Stage_refine_node,
     Stage_advance_node,
+    # Helpers
+    _classify_failure_type,
 )
 
 
@@ -121,12 +123,21 @@ def route_after_feedback(state: SolverState) -> Literal["plan", "stage_identify"
         vulns = analysis.get("vulnerabilities", [])
         vuln_types = {v.get("type", "").lower() for v in vulns}
         strategy_lower = str(analysis.get("strategy", "")).lower()
-        # OOB, format_string 등은 스택 오버플로우가 아님 → buf_offset 불필요
-        non_stack = ("out_of_bounds", "oob", "format_string", "fmt", "use_after_free", "uaf")
-        has_non_stack = (
-            any(t in non_stack for t in vuln_types)
-            or "oob" in strategy_lower or "got overwrite" in strategy_lower or "ret2win" in strategy_lower
+        # heap/vtable/type_confusion만 — 스택 미사용, dv/canary 불필요
+        # oob, format_string 제외 (스택 기반 가능, canary 적용 가능)
+        non_stack = (
+            "use_after_free", "uaf", "heap_overflow", "double_free",
+            "type_confusion", "type confusion", "vtable", "vtable_overwrite",
         )
+        vuln_norm = {t.replace(" ", "_") for t in vuln_types}
+        has_non_stack = (
+            any(t in non_stack or t.replace("_", " ") in non_stack for t in vuln_norm)
+            or "got overwrite" in strategy_lower or "vtable" in strategy_lower
+            or "type confusion" in strategy_lower or "heap" in strategy_lower
+        )
+        has_win = analysis.get("win_function", False) or bool(analysis.get("win_function_addr"))
+        # heap/vtable/type_confusion + win in binary: dv 불필요
+        skip_dv_for_path = has_non_stack and has_win
         needs_stack_offsets = (
             any(t in ("buffer_overflow", "bof", "stack_overflow") for t in vuln_types)
             and not has_non_stack
@@ -145,31 +156,36 @@ def route_after_feedback(state: SolverState) -> Literal["plan", "stage_identify"
         # the LLM already understands the offsets from static/source analysis.
         came_from_stage_failure = bool(state.get("exploit_failure_context"))
 
-        if (has_canary or has_pie) and not dv_complete and not came_from_stage_failure:
+        if (
+            (has_canary or has_pie)
+            and not dv_complete
+            and not came_from_stage_failure
+            and not skip_dv_for_path
+        ):
             from rich.console import Console
             _console = Console()
 
             # Track how many times we've been forced back for GDB.
-            # After GDB_MAX_FORCE attempts, bypass the requirement and proceed with
-            # static analysis — prevents an infinite plan→gdb→plan loop when pwndbg
-            # fails to populate exact integer offsets (e.g. interactive binary, no source).
+            # Bypass when: GDB_MAX_FORCE attempts, OR duplicate loop (no executions, already tried once)
             GDB_MAX_FORCE = 2
             gdb_forced = state.get("gdb_forced_count", 0)
+            parsing_no_exec = state.get("parsing_had_no_executions", False)
 
-            if gdb_forced >= GDB_MAX_FORCE:
+            if gdb_forced >= GDB_MAX_FORCE or (parsing_no_exec and gdb_forced >= 1):
+                reason = "duplicate tasks (no new executions)" if parsing_no_exec else f"{gdb_forced} GDB attempt(s)"
                 _console.print(
-                    f"[yellow]⚠ Dynamic verification still incomplete after {gdb_forced} GDB "
-                    f"attempt(s) — proceeding with static analysis only[/yellow]"
+                    f"[yellow]⚠ Dynamic verification incomplete ({reason}) — proceeding with static analysis[/yellow]"
                 )
                 return "stage_identify"
 
-            state["gdb_forced_count"] = gdb_forced + 1
+            # NOTE: state 변경은 여기서 하지 않음.
+            # gdb_forced_count 증가는 Feedback_node에서 처리 (routing function의 state 변경은 LangGraph에서 반영 안 됨).
             _console.print(
                 "[yellow]⚠ Canary/PIE detected but dynamic_verification incomplete "
                 f"(verified={dv.get('verified')}, "
                 f"canary_offset={dv.get('buf_offset_to_canary')}, "
                 f"ret_offset={dv.get('buf_offset_to_ret')}) "
-                f"— forcing GDB run before exploit (attempt {gdb_forced + 1}/{GDB_MAX_FORCE})[/yellow]"
+                f"— forcing GDB run before exploit (attempt {gdb_forced}/{GDB_MAX_FORCE})[/yellow]"
             )
             return "plan"
 
@@ -213,6 +229,48 @@ def route_after_stage_verify(
         max_refine = 3
         max_regen  = 2  # fresh full regenerations before falling back to plan
 
+        # --- Early escalation: same failure type repeated without improvement ---
+        # If we've seen the same failure category >= 2 times, further refinement
+        # won't help — escalate directly to re-analysis (plan).
+        # Exception: CONNECTION_CLOSED often resolves with a single retry, so skip it.
+        _current_ft = _classify_failure_type(current_stage.get("error", ""))
+        _ft_history = current_stage.get("failure_type_history", [])
+        _ESCALATE_TYPES = {"TIMED_OUT", "WRONG_VALUE", "WRONG_FORMAT", "EXCEPTION"}
+        _TIMED_OUT_THRESHOLD = 1   # even 1 repeat → escalate (I/O protocol issue)
+        _GENERAL_THRESHOLD   = 2   # 2 repeats of the same type → escalate
+
+        if _current_ft in _ESCALATE_TYPES and _ft_history:
+            # Count consecutive same-type entries from the END of history only
+            _consecutive = 0
+            for _t in reversed(_ft_history):
+                if _t == _current_ft:
+                    _consecutive += 1
+                else:
+                    break
+            _threshold = _TIMED_OUT_THRESHOLD if _current_ft == "TIMED_OUT" else _GENERAL_THRESHOLD
+            if _consecutive >= _threshold:
+                console.print(
+                    f"[red]Stage {current_idx+1} escalating: '{_current_ft}' "
+                    f"failed {_consecutive + 1} times in a row (history={_ft_history}) "
+                    f"— refinement ineffective, re-analyzing[/red]"
+                )
+                state["analysis_failure_reason"] = (
+                    f"Stage '{current_stage.get('stage_id', '?')}' failed with "
+                    f"'{_current_ft}' {_consecutive + 1} times in a row — "
+                    f"refinement made no progress. Last error: "
+                    f"{current_stage.get('error', '')[:400]}"
+                )
+                state["exploit_failure_context"] = {
+                    "stage_id": current_stage.get("stage_id", ""),
+                    "stage_index": current_idx,
+                    "code": current_stage.get("code", "")[:2000],
+                    "error": current_stage.get("error", "")[:1000],
+                    "attempts": attempts,
+                    "failure_type": _current_ft,
+                    "failure_type_history": _ft_history,
+                }
+                return "plan"
+
         if attempts < max_refine:
             console.print(f"[yellow]Stage {current_idx+1} failed (attempt {attempts+1}/{max_refine}) → refining[/yellow]")
             return "stage_refine"
@@ -248,6 +306,48 @@ def route_after_stage_verify(
                     "error": current_stage.get("error", "")[:1000],
                     "attempts": max_refine * max_regen,
                 }
+
+                # 이전 Stage 재검증:
+                # Stage N이 모든 재시도를 소진했을 때 Stage N-1의 결과가
+                # 잘못된 검증(false positive)을 통과했을 가능성을 고려.
+                # Skip re-invalidation when failure is env/path or leak-parsing (not upstream false positive).
+                stage_error = (current_stage.get("error") or "") + (state.get("exploit_failure_context", {}).get("error", "") or "")
+                is_env_or_path_failure = (
+                    "FileNotFoundError" in stage_error
+                    or ("No such file" in stage_error and "libc" in stage_error.lower())
+                )
+                is_leak_or_parse_failure = (
+                    "Leak parsing failed" in stage_error
+                    or "unpack requires" in stage_error
+                    or "STAGE_FAILED" in stage_error
+                )
+                if current_idx > 0 and not is_env_or_path_failure and not is_leak_or_parse_failure:
+                    prev_stage = stages[current_idx - 1]
+                    if prev_stage.get("verified"):
+                        console.print(
+                            f"[yellow]⚠ Re-invalidating Stage {current_idx} "
+                            f"('{prev_stage.get('stage_id', '?')}') — "
+                            f"downstream Stage {current_idx+1} exhausted all retries, "
+                            f"upstream result may be a false positive[/yellow]"
+                        )
+                        prev_stage["verified"] = False
+                        prev_stage["refinement_attempts"] = 0
+                        prev_stage["regen_count"] = 0
+                        prev_stage["error"] = (
+                            f"Re-invalidated: Stage {current_idx+1} "
+                            f"('{current_stage.get('stage_id', '?')}') exhausted all retries. "
+                            f"This stage's output may have been a false positive "
+                            f"(e.g. stack address mistaken for libc address)."
+                        )
+                        stages[current_idx - 1] = prev_stage
+                        # current_stage도 초기화하여 이전 Stage 재성공 후 재시도 가능하게
+                        current_stage["refinement_attempts"] = 0
+                        current_stage["regen_count"] = 0
+                        current_stage["verified"] = False
+                        stages[current_idx] = current_stage
+                        state["staged_exploit"]["stages"] = stages
+                        state["staged_exploit"]["current_stage_index"] = current_idx - 1
+
                 return "plan"
 
 

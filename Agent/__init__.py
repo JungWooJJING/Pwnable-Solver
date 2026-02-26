@@ -18,6 +18,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from Agent.base import (
     BaseAgent,
+    LLMRetryExhausted,
     TokenMetrics,
     HistoryManager,
     LLMClient,

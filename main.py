@@ -10,6 +10,7 @@ import sys
 import os
 import argparse
 from pathlib import Path
+from typing import Optional
 
 # Ensure project root is in sys.path for package imports
 _PROJECT_ROOT = str(Path(__file__).resolve().parent)
@@ -22,6 +23,7 @@ from rich.table import Table
 
 from LangGraph.state import init_state, SolverState
 from LangGraph.workflow import create_app
+from LangGraph.node import get_total_metrics
 
 console = Console()
 
@@ -173,6 +175,10 @@ def display_summary(state: SolverState) -> None:
     # Flag
     if state.get("flag_detected"):
         console.print(f"[bold green]FLAG: {state.get('detected_flag')}[/bold green]")
+
+    # Total cost
+    metrics = get_total_metrics()
+    console.print(f"[bold]Total Cost:[/bold] ${metrics['total_cost_usd']:.4f}")
 
 
 def ask_continue(iteration: int, state: SolverState) -> bool:
@@ -352,7 +358,12 @@ def run_solver(state: SolverState, ask_interval: int = 5) -> SolverState:
     return final_state or state
 
 
-def setup_docker_env(binary_path: str, port: int = 1337, analysis: bool = True) -> bool:
+def setup_docker_env(
+    binary_path: str,
+    port: int = 1337,
+    analysis: bool = True,
+    state: Optional[dict] = None,
+) -> bool:
     """Setup Docker environment for exploit testing (+ optional analysis container with pwndbg)"""
     from Tool.tool import Tool
 
@@ -366,6 +377,17 @@ def setup_docker_env(binary_path: str, port: int = 1337, analysis: bool = True) 
         console.print(result)
         if "[SUCCESS]" not in result:
             return False
+
+        # 컨테이너 내부 libc를 호스트로 추출하여 state에 저장
+        # → exploit 코드가 호스트 libc 대신 컨테이너와 동일한 libc를 사용하게 됨
+        libc_path = tool.Docker_extract_libc()
+        if libc_path and state is not None:
+            state.setdefault("analysis", {}).setdefault("libc", {})
+            state["analysis"]["libc"]["detected"] = True
+            state["analysis"]["libc"]["path"] = libc_path
+            console.print(f"[bold green]Container libc stored in analysis: {libc_path}[/bold green]")
+        elif not libc_path:
+            console.print("[yellow]Warning: Could not extract libc from container — exploit will use host libc[/yellow]")
 
         # 분석 컨테이너 (pwndbg 포함 — 챌린지 이미지 기반)
         if analysis:
@@ -437,7 +459,7 @@ def main():
     # Setup Docker if requested
     if args.docker and binary_path:
         use_analysis = not args.no_analysis_docker
-        if not setup_docker_env(binary_path, args.docker_port, analysis=use_analysis):
+        if not setup_docker_env(binary_path, args.docker_port, analysis=use_analysis, state=state):
             console.print("[yellow]Warning: Docker setup failed, continuing without Docker[/yellow]")
         else:
             console.print(f"[green]Docker environment ready on port {args.docker_port}[/green]")

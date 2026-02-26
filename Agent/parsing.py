@@ -205,6 +205,7 @@ class ParsingAgent(BaseAgent):
 
         if not executions:
             console.print("[yellow]No executions to parse[/yellow]")
+            state["parsing_had_no_executions"] = True
             return state
 
         # Split executions into deterministic and LLM-required
@@ -308,10 +309,18 @@ class ParsingAgent(BaseAgent):
             console.print("[dim]All outputs parsed deterministically, no LLM call needed[/dim]")
 
         # Infer offset/leak from key_findings for readiness (LLM이 구조화하지 않은 경우 대비)
+        # Include raw stdout from executions for DV extraction (canary/ret offsets)
         analysis = state.get("analysis", {})
-        if all_key_findings:
-            infer_readiness_from_key_findings(analysis, all_key_findings)
-            state["analysis"] = analysis
+        extras = []
+        for ex in executions:
+            stdout = ex.get("stdout", "")[:8000]
+            if stdout:
+                extras.append(stdout)
+        infer_readiness_from_key_findings(
+            analysis,
+            all_key_findings + extras if extras else all_key_findings,
+        )
+        state["analysis"] = analysis
 
         # --- Store results ---
         state["parsing_output"] = {
@@ -335,4 +344,5 @@ class ParsingAgent(BaseAgent):
         for task_id in instruction_json.get("selected_tasks", []):
             mark_task_status(state, task_id, "done")
 
+        state["parsing_had_no_executions"] = False
         return state

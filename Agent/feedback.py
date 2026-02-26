@@ -93,6 +93,27 @@ class FeedbackAgent(BaseAgent):
                 f"If PIE leak returns 0x0 or an ASCII-like value, the pattern_len / offset is wrong."
             )
 
+        # Detect unverified "potential" findings in key_findings and surface them as blockers.
+        # These are often hallucinated or unconfirmed and should NOT drive exploitation.
+        import re as _re_fb
+        key_findings = analysis.get("key_findings", [])
+        potential_findings = []
+        for finding in key_findings:
+            lower = str(finding).lower()
+            if _re_fb.search(r'\b(?:potential(?:ly)?|possibly|may\s+be\s+able\s+to|might)\b', lower):
+                potential_findings.append(str(finding))
+        if potential_findings:
+            console.print(f"[yellow]⚠ Unverified potential findings: {len(potential_findings)} item(s)[/yellow]")
+            for pf in potential_findings[:3]:
+                console.print(f"[yellow]  • {pf[:120]}[/yellow]")
+            feedback_parts.append(
+                f"[UNVERIFIED FINDINGS] The following findings are still 'potential'/'possible' "
+                f"and have NOT been confirmed by dynamic analysis or decompilation:\n"
+                + "\n".join(f"  • {pf[:200]}" for pf in potential_findings[:5])
+                + "\n→ Do NOT use these as confirmed primitives. "
+                f"Run GDB or decompile the relevant functions to confirm before proceeding."
+            )
+
         # Key analysis hints for Plan
         dv = analysis.get("dynamic_verification", {})
         if dv.get("buf_offset_to_canary"):

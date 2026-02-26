@@ -13,7 +13,9 @@ import json
 import time
 import asyncio
 import logging
+import signal
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -24,8 +26,42 @@ console = Console()
 
 
 # =============================================================================
+# Timeout helper
+# =============================================================================
+
+@contextmanager
+def _api_timeout(seconds: int):
+    """
+    Python-level hard timeout via SIGALRM.
+    API 클라이언트 레벨 timeout이 작동하지 않을 경우를 대비한 백업.
+    메인 스레드에서만 사용 가능 (SIGALRM 제약).
+    """
+    def _handler(signum, frame):
+        raise TimeoutError(f"LLM API call timed out after {seconds}s")
+
+    # SIGALRM은 메인 스레드에서만 사용 가능; 서브스레드에서는 스킵
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+# =============================================================================
 # Token Metrics
 # =============================================================================
+
+class LLMRetryExhausted(RuntimeError):
+    """모든 LLM API 재시도가 소진됐을 때 발생. RuntimeError를 상속해 기존 except RuntimeError도 호환."""
+    pass
+
 
 @dataclass
 class TokenMetrics:
@@ -286,11 +322,13 @@ class LLMClient(ABC):
 
 class OpenAIClient(LLMClient):
     """OpenAI API client with truncation support."""
-    
+
+    _HTTP_TIMEOUT_SEC = 180  # 3분
+
     def __init__(self):
         try:
             from openai import OpenAI  # type: ignore[import-not-found]
-            self.client = OpenAI()
+            self.client = OpenAI(timeout=self._HTTP_TIMEOUT_SEC)
         except ImportError:
             raise RuntimeError("openai package not installed. Run: pip install openai")
     
@@ -332,6 +370,9 @@ class OpenAIClient(LLMClient):
 class GeminiClient(LLMClient):
     """Google Gemini API client (google.genai SDK)."""
 
+    # API 요청 timeout (ms). 서버가 응답 없이 연결을 유지할 때 무한 대기 방지.
+    _HTTP_TIMEOUT_MS = 180_000  # 3분
+
     def __init__(self):
         try:
             from google import genai  # type: ignore[import-not-found]
@@ -339,7 +380,10 @@ class GeminiClient(LLMClient):
             api_key = os.environ.get("GEMINI_API_KEY")
             if not api_key:
                 raise RuntimeError("GEMINI_API_KEY not set")
-            self.client = genai.Client(api_key=api_key)
+            self.client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=self._HTTP_TIMEOUT_MS),
+            )
             self.types = types
         except ImportError:
             raise RuntimeError("google-genai package not installed. Run: pip install google-genai")
@@ -451,7 +495,7 @@ class BaseAgent(ABC):
         provider: Optional[str] = None,
         max_context_tokens: Optional[int] = None,
         temperature: float = 0.7,
-        max_retries: int = 5,
+        max_retries: int = 10,
         retry_delay: float = 1.0,
     ):
         self.name = name
@@ -532,21 +576,25 @@ class BaseAgent(ABC):
             msgs_to_send = messages
         
         # Retry loop
+        # Hard timeout per attempt: API 클라이언트 timeout보다 30초 더 길게 설정
+        # (클라이언트 timeout이 먼저 발동되는 게 정상; SIGALRM은 백업)
+        _HARD_TIMEOUT_SEC = 210  # 3분 30초
         last_error = None
         for attempt in range(self.max_retries):
             try:
-                response, usage = self.client.chat(
-                    messages=msgs_to_send,
-                    model=self.model,
-                    temperature=self.temperature,
-                )
-                
+                with _api_timeout(_HARD_TIMEOUT_SEC):
+                    response, usage = self.client.chat(
+                        messages=msgs_to_send,
+                        model=self.model,
+                        temperature=self.temperature,
+                    )
+
                 self._update_metrics(usage)
-                
+
                 # Add assistant response to history
                 if use_history:
                     self.history.add_message("assistant", response)
-                
+
                 # Log usage
                 console.print(
                     f"[dim]{self.name} | "
@@ -554,9 +602,9 @@ class BaseAgent(ABC):
                     f"Out: {usage.get('output_tokens', 0):,} | "
                     f"Cost: ${self.metrics.total_cost_usd:.4f}[/dim]"
                 )
-                
+
                 return response
-                
+
             except Exception as e:
                 last_error = e
                 wait_time = self.retry_delay * (2 ** attempt)
@@ -565,9 +613,49 @@ class BaseAgent(ABC):
                 )
                 console.print(f"[yellow]Retrying in {wait_time:.1f}s...[/yellow]")
                 time.sleep(wait_time)
-        
-        raise RuntimeError(f"{self.name} failed after {self.max_retries} retries: {last_error}")
-    
+
+        raise LLMRetryExhausted(f"{self.name} failed after {self.max_retries} retries: {last_error}")
+
+    def call_llm_and_parse(
+        self,
+        required_keys: Optional[List[str]] = None,
+        max_parse_retries: int = 2,
+    ) -> tuple:
+        """
+        LLM 호출 후 JSON 파싱. 필수 필드 누락 또는 partial JSON일 경우 재시도.
+
+        Args:
+            required_keys: 반드시 존재해야 하는 JSON 키 목록 (None이면 검사 안 함)
+            max_parse_retries: 필드 누락 시 재시도 횟수
+
+        Returns:
+            (parsed: dict, response_text: str)
+        """
+        for attempt in range(max_parse_retries + 1):
+            response_text = self.call_llm()
+            parsed = parse_json_response(response_text)
+
+            if not required_keys:
+                return parsed, response_text
+
+            missing = [k for k in required_keys if not parsed.get(k)]
+            is_partial = parsed.get("_partial") or parsed.get("_parse_error")
+
+            if not missing and not is_partial:
+                return parsed, response_text
+
+            if attempt < max_parse_retries:
+                reason = f"missing fields: {missing}" if missing else "incomplete JSON"
+                console.print(f"[yellow]JSON parse incomplete ({reason}), retrying ({attempt+1}/{max_parse_retries})...[/yellow]")
+                self.add_user_message(
+                    f"Your previous response was incomplete ({reason}). "
+                    f"Please provide a complete JSON response including all required fields: {required_keys}."
+                )
+            else:
+                console.print(f"[yellow]JSON still incomplete after {max_parse_retries} retries, using partial result[/yellow]")
+
+        return parsed, response_text
+
     def set_system_prompt(self, content: str) -> None:
         """Set or replace system prompt."""
         # Remove existing system message if any
@@ -853,6 +941,7 @@ def parse_json_response(text: str) -> Dict[str, Any]:
     partial = _extract_partial_data(text)
     if partial:
         console.print(f"[yellow]Extracted partial JSON data: {list(partial.keys())}[/yellow]")
+        partial["_partial"] = True  # 호출부에서 필수 필드 누락 여부 확인용
         return partial
 
     # Final fallback

@@ -218,27 +218,40 @@ class InstructionAgent(BaseAgent):
         }
 
         try:
+            # Run: substitute relative libc path with state libc path; skip if cmd already uses absolute path to avoid duplication (e.g. Challenge//home/.../libc.so.6).
+            if tool_name == "Run" and "cmd" in args:
+                libc_info = (state.get("analysis") or {}).get("libc") or {}
+                abs_libc = libc_info.get("path", "") if isinstance(libc_info, dict) else ""
+                if abs_libc and "libc" in (args.get("cmd") or ""):
+                    cmd = args["cmd"]
+                    if abs_libc not in cmd:
+                        cmd = cmd.replace("./libc.so.6", abs_libc).replace("libc.so.6", abs_libc)
+                    args = {**args, "cmd": cmd}
             method = getattr(tool, tool_name, None)
             if method is None:
                 result["stderr"] = f"Unknown tool: {tool_name}"
                 return result
 
+            # 동적 분석용 바이너리: pwninit 패치가 있으면 그걸로 GDB 실행 (범용)
+            if tool_name == "Pwndbg":
+                analysis_binary = state.get("patched_binary") or state.get("binary_path")
+                args = {**args, "dynamic_binary": analysis_binary or ""}
+
             output = method(**args)
 
-            # Pwninit 특수 처리 - dict 반환
+            # Pwninit 특수 처리 - dict 반환 (patched_binary만 저장, binary_path는 원본 유지)
             if tool_name == "Pwninit" and isinstance(output, dict):
                 result["stdout"] = output.get("output", "")
                 result["success"] = output.get("success", False)
 
-                # 패치된 바이너리로 경로 업데이트
                 patched = output.get("patched_binary")
                 if patched:
-                    old_path = state.get("binary_path", "")
-                    state["binary_path"] = patched
-                    state["original_binary_path"] = old_path  # 원본 보관
-                    tool.binary_path = patched  # Tool 인스턴스도 업데이트
-                    result["stdout"] += f"\n\n[AUTO] binary_path updated: {patched}"
-                    console.print(f"[green]Binary path updated to: {patched}[/green]")
+                    state["patched_binary"] = patched
+                    result["stdout"] += (
+                        f"\n\n[AUTO] patched_binary saved: {patched} — "
+                        "Pwndbg, core dump analysis, and binary probe will use it for dynamic analysis."
+                    )
+                    console.print(f"[green]Patched binary saved for dynamic analysis: {patched}[/green]")
             else:
                 result["stdout"] = str(output) if output else ""
                 result["success"] = not str(output).startswith("Error:")

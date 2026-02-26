@@ -202,7 +202,8 @@ class SolverState(TypedDict, total=False):
     env: Dict[str, Any]
 
     # --- 타겟/분석 ---
-    binary_path: str
+    binary_path: str              # 원본 바이너리 (분석/checksec/ROPgadget 등)
+    patched_binary: str           # pwninit 생성 패치 바이너리 (있으면 동적분석·GDB·코어덤프에 사용)
     directory_listing: str         # ls output of working directory
     target_info: Dict[str, Any]    # 추가 타겟 정보
     protections: Dict[str, Any]    # checksec 등
@@ -251,6 +252,9 @@ class SolverState(TypedDict, total=False):
 
     # --- Staged Exploit (단계별 익스플로잇) ---
     staged_exploit: StagedExploitPlan
+
+    # --- 검증된 스테이지 코드 재활용 (stage_id → code; 다른 전략에서 같은 stage 필요 시 재사용) ---
+    verified_stage_code_by_id: Dict[str, str]
 
     # --- 실패 컨텍스트 (Plan 재진입 시 사용) ---
     analysis_failure_reason: str        # "stage_failed", "exploit_failed" 등
@@ -304,6 +308,7 @@ def init_state(**overrides: Any) -> SolverState:
         "env": {},
 
         "binary_path": "",
+        "patched_binary": "",
         "directory_listing": "",
         "target_info": {},
         "protections": {},
@@ -353,6 +358,9 @@ def init_state(**overrides: Any) -> SolverState:
             "all_stages_verified": False,
         },
 
+        # Verified stage code by stage_id (reuse when same stage needed in another strategy)
+        "verified_stage_code_by_id": {},
+
         # 실패 컨텍스트
         "analysis_failure_reason": "",
         "exploit_failure_context": {},
@@ -372,6 +380,7 @@ def get_state_for_plan(state: SolverState) -> Dict[str, Any]:
         "cwd": state.get("cwd", ""),
         "constraints": state.get("constraints", []),
         "binary_path": state.get("binary_path", ""),
+        "patched_binary": state.get("patched_binary", ""),
         "target_info": state.get("target_info", {}),
         "protections": state.get("protections", {}),
         "mitigations": state.get("mitigations", []),
@@ -396,6 +405,7 @@ def get_state_for_instruction(state: SolverState) -> Dict[str, Any]:
         "constraints": state.get("constraints", []),
         "cwd": state.get("cwd", ""),
         "binary_path": state.get("binary_path", ""),
+        "patched_binary": state.get("patched_binary", ""),
         "target_info": state.get("target_info", {}),
         "protections": state.get("protections", {}),
         "mitigations": state.get("mitigations", []),
@@ -439,6 +449,7 @@ def get_state_for_exploit(state: SolverState) -> Dict[str, Any]:
     """Exploit Agent: exploit 실행에 필요한 것만 전달(과도한 노이즈 제거)."""
     return {
         "binary_path": state.get("binary_path", ""),
+        "patched_binary": state.get("patched_binary", ""),
         "protections": state.get("protections", {}),
         "mitigations": state.get("mitigations", []),
         "facts": state.get("facts", {}),
@@ -659,8 +670,13 @@ def merge_analysis_updates(state: SolverState, updates: Dict[str, Any]) -> None:
 
     # I/O patterns (append new ones, deduplicate by prompt string)
     if "io_patterns" in updates:
-        existing_prompts = {p.get("prompt", "") for p in analysis.get("io_patterns", [])}
+        existing_prompts = {p.get("prompt", "") if isinstance(p, dict) else str(p) for p in analysis.get("io_patterns", [])}
         for pattern in updates["io_patterns"]:
+            # LLM이 string으로 반환하는 경우 dict로 정규화
+            if isinstance(pattern, str):
+                pattern = {"prompt": pattern, "response": ""}
+            if not isinstance(pattern, dict):
+                continue
             if pattern.get("prompt", "") not in existing_prompts:
                 analysis.setdefault("io_patterns", []).append(pattern)
                 existing_prompts.add(pattern.get("prompt", ""))
@@ -676,11 +692,24 @@ def merge_analysis_updates(state: SolverState, updates: Dict[str, Any]) -> None:
             analysis[field] = str(updates[field])
 
     # Dynamic verification (LLM-extracted from Pwndbg output — deep merge)
+    # 범용: 이미 검증된 오프셋(verified=True, buf_offset_*)이 있으면 LLM/파싱 결과로 덮어쓰지 않음.
     if "dynamic_verification" in updates:
         dv_upd = updates["dynamic_verification"]
         dv = analysis.setdefault("dynamic_verification", {"verified": False, "local_vars": [], "raw_gdb_output": ""})
         if isinstance(dv_upd, dict):
-            dv.update(dv_upd)
+            already_verified = (
+                dv.get("verified") is True
+                and isinstance(dv.get("buf_offset_to_canary"), int)
+                and isinstance(dv.get("buf_offset_to_ret"), int)
+            )
+            if already_verified:
+                # 검증된 오프셋은 유지, 그 외 필드만 머지 (raw_gdb_output, local_vars 등)
+                protected = {"buf_offset_to_canary", "buf_offset_to_ret", "verified"}
+                for k, v in dv_upd.items():
+                    if k not in protected:
+                        dv[k] = v
+            else:
+                dv.update(dv_upd)
         else:
             # LLM이 문자열/리스트 등 잘못된 타입 반환 시 방어 (ValueError 방지)
             if isinstance(dv_upd, (list, tuple)):
@@ -736,12 +765,19 @@ def infer_readiness_from_key_findings(analysis: Analysis, key_findings: List[str
         return
     text = " ".join(str(f) for f in key_findings).lower()
 
+    # Strip tentative/potential phrases before readiness inference.
+    # "potential leak primitive" must NOT set leak_primitive=True until verified.
+    text_confirmed = re.sub(
+        r'\b(?:potential(?:ly)?|possibly|may\s+be\s+able\s+to|might\s+be\s+able\s+to|could\s+potentially)\b[^,;.!?\n]*',
+        '', text, flags=re.I
+    )
+
     # offset_or_detail_known: hex offset, index -N, arr[-N] 패턴
     has_offset_hint = any(
         [
-            "0x" in text and ("offset" in text or "arr" in text or "got" in text),
-            "index -" in text or "index -" in text.replace(" ", ""),
-            "arr[-" in text or "arr[" in text and "-" in text,
+            "0x" in text_confirmed and ("offset" in text_confirmed or "arr" in text_confirmed or "got" in text_confirmed),
+            "index -" in text_confirmed or "index -" in text_confirmed.replace(" ", ""),
+            "arr[-" in text_confirmed or "arr[" in text_confirmed and "-" in text_confirmed,
         ]
     )
     vulns = analysis.get("vulnerabilities", [])
@@ -751,17 +787,22 @@ def infer_readiness_from_key_findings(analysis: Analysis, key_findings: List[str
                 v["estimated_offset"] = 1  # placeholder: offset 정보 존재함을 표시
                 break
 
-    # leak_primitive: PIE leak, OOB read, arr[- 등
+    # leak_primitive: PIE leak, canary leak, OOB read, arr[- 등
+    # Use text_confirmed to avoid false readiness from "potential leak" phrases.
     leak_hint = any(
         [
-            "leak" in text and ("pie" in text or "base" in text or "got" in text),
-            "arr[-" in text or ("arr[" in text and "-" in text),
-            "index -" in text,
-            "self-pointer" in text or "self pointer" in text,
-            "oob read" in text or "oob" in text and "read" in text,
+            "leak" in text_confirmed and ("pie" in text_confirmed or "base" in text_confirmed or "got" in text_confirmed),
+            "leak" in text_confirmed and ("canary" in text_confirmed or "puts" in text_confirmed or "command" in text_confirmed),
+            "can leak" in text_confirmed or "leak primitive" in text_confirmed or "leak the canary" in text_confirmed,
+            "arr[-" in text_confirmed or ("arr[" in text_confirmed and "-" in text_confirmed),
+            "index -" in text_confirmed,
+            "self-pointer" in text_confirmed or "self pointer" in text_confirmed,
+            "oob read" in text_confirmed or ("oob" in text_confirmed and "read" in text_confirmed),
         ]
     )
-    if leak_hint and analysis.get("win_function"):
+    has_win = analysis.get("win_function") or bool(analysis.get("win_function_addr"))
+    leak_target = "canary" in text_confirmed or "puts" in text_confirmed or "got" in text_confirmed or "pie" in text_confirmed or "oob" in text_confirmed or has_win
+    if leak_hint and leak_target:
         analysis["leak_primitive"] = True
 
     # OOB+GOT: parse pie_leak_index, pie_leak_offset, got_targets from key_findings
@@ -792,6 +833,62 @@ def infer_readiness_from_key_findings(analysis: Analysis, key_findings: List[str
             oob["got_targets"] = got_targets
         if oob:
             analysis["oob_got_info"] = oob
+
+    # dynamic_verification: buf_offset_to_canary, buf_offset_to_ret from key_findings
+    dv = analysis.setdefault("dynamic_verification", {"verified": False, "local_vars": [], "raw_gdb_output": ""})
+    if dv.get("verified") is True and isinstance(dv.get("buf_offset_to_canary"), int) and isinstance(dv.get("buf_offset_to_ret"), int):
+        return  # already complete
+    canary_off = None
+    ret_off = None
+    # "distance from buffer start to canary is 23 bytes", "canary.*23", "offset 23.*canary"
+    for m in re.finditer(r"(?:distance\s+)?(?:from\s+)?buffer\s+(?:start\s+)?to\s+canary\s+is\s+(\d+)|canary.*?(?:at|offset|is)\s+(\d+)|(\d+)\s*(?:bytes?)\s*(?:from\s+buffer)?.*?canary", text, re.I):
+        canary_off = int((m.group(1) or m.group(2) or m.group(3) or "0"))
+        if 8 <= canary_off <= 500:
+            break
+    # ret 패턴은 "return address" / "RIP" / "return addr" 키워드가 포함된 문장에서만 매칭.
+    # "ret" 단어 하나만 있는 패턴은 제거 — canary 문장에 "return" 이 같이 등장하면
+    # 동일 숫자가 canary_off 와 ret_off 양쪽에 들어가는 오탐의 원인이 됨.
+    for m in re.finditer(
+        r"(?:distance\s+)?(?:from\s+)?buffer\s+(?:start\s+)?to\s+(?:RIP|return\s+address|return\s+addr).*?is\s+(\d+)"
+        r"|(?:return\s+address|return\s+addr|RIP).*?(?:at|offset|is)\s+(\d+)"
+        r"|(\d+)\s*(?:bytes?)\s*(?:from\s+buffer)?.*?(?:return\s+address|return\s+addr|RIP)",
+        text, re.I
+    ):
+        ret_off = int((m.group(1) or m.group(2) or m.group(3) or "0"))
+        if 16 <= ret_off <= 600:
+            break
+    # RBP-based: "buffer at rbp-0x1f", "canary at rbp-0x8" -> canary = buf_dist-8, ret = buf_dist+8
+    if canary_off is None or ret_off is None:
+        buf_rbp = None
+        canary_rbp = None
+        for m in re.finditer(r"(?:buffer|local_\w+).*?rbp\s*[-+]\s*0x([0-9a-f]+)|rbp\s*[-+]\s*0x([0-9a-f]+).*?(?:buffer|bytes)", text, re.I):
+            buf_rbp = buf_rbp or (m.group(1) or m.group(2))
+        for m in re.finditer(r"canary.*?rbp\s*-\s*0x([0-9a-f]+)|rbp\s*-\s*0x8.*?canary", text, re.I):
+            canary_rbp = canary_rbp or (m.group(1) or "8")
+        if buf_rbp and canary_rbp:
+            try:
+                buf_dist = int(buf_rbp, 16)
+                canary_dist = int(canary_rbp, 16)
+                canary_off = buf_dist - canary_dist
+                ret_off = buf_dist + 8
+                if not (8 <= canary_off <= 500):
+                    canary_off = None
+                if not (16 <= ret_off <= 600):
+                    ret_off = None
+            except ValueError:
+                pass
+    # 64-bit 스택 레이아웃 sanity check:
+    #   buf → [canary_off bytes] → canary(8B) → saved_rbp(8B) → ret
+    #   따라서 ret_off >= canary_off + 16 이어야 함.
+    # 같거나 작으면 두 오프셋이 동일 값(e.g. 15)으로 잘못 파싱된 것이므로 버림.
+    if isinstance(canary_off, int) and isinstance(ret_off, int):
+        if ret_off >= canary_off + 16:
+            dv["buf_offset_to_canary"] = canary_off
+            dv["buf_offset_to_ret"] = ret_off
+            dv["verified"] = True
+        else:
+            # 논리적으로 불가능한 오프셋 쌍 — 저장하지 않고 재분석을 유도
+            pass
 
 
 # =========================
@@ -903,7 +1000,7 @@ def compute_readiness(analysis: Analysis, runs: Optional[List] = None) -> Tuple[
     tier3_items = 0
     tier3_done = 0
 
-    has_win = analysis.get("win_function", False)
+    has_win = analysis.get("win_function", False) or bool(analysis.get("win_function_addr"))
 
     if has_win and not pie:
         # Simple ret2win (no PIE): fixed address → no leak, no gadgets, no libc needed
@@ -956,7 +1053,15 @@ def compute_readiness(analysis: Analysis, runs: Optional[List] = None) -> Tuple[
             missing.append("tier3_unknown_until_checksec")
 
     # --- Tier 4: Dynamic Verification (+0.20) ---
-    # Primary check: LLM has extracted and stored verified runtime values
+    # heap/vtable/type_confusion + win: dv 불필요. oob, format_string 제외 (스택 기반 가능)
+    non_stack_vulns = (
+        "use_after_free", "uaf", "heap_overflow", "double_free",
+        "type_confusion", "type confusion", "vtable", "vtable_overwrite",
+    )
+    vuln_type_set = {v.get("type", "").lower().replace(" ", "_") for v in vulns}
+    has_non_stack_vuln = any(t in non_stack_vulns or t.replace("_", " ") in non_stack_vulns for t in vuln_type_set)
+    dv_not_needed = has_non_stack_vuln and has_win
+
     dv = analysis.get("dynamic_verification", {})
     has_dynamic = bool(dv.get("verified"))
     # Fallback: any Pwndbg/GDB run recorded (partial credit — half score)
@@ -972,8 +1077,10 @@ def compute_readiness(analysis: Analysis, runs: Optional[List] = None) -> Tuple[
     if has_dynamic:
         completed.append("dynamic_verification_done")
         score += 0.20
+    elif dv_not_needed:
+        completed.append("dv_not_needed_for_path")
+        score += 0.20
     elif has_gdb_run:
-        # GDB was run but values not yet parsed/stored — partial credit
         completed.append("dynamic_verification_partial")
         score += 0.10
     else:
